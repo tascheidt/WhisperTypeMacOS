@@ -1,6 +1,22 @@
 import Cocoa
 import CoreGraphics
 import AVFoundation
+import Accessibility // Need this for AXUIElement types
+import Carbon.HIToolbox // For TIS/... and UCKeyTranslate/...
+import KeyboardShortcuts // Keep if you still use its other features, otherwise optional
+
+// --- Ollama API Data Structures ---
+struct OllamaTagsResponse: Codable {
+    let models: [OllamaModel]
+}
+
+struct OllamaModel: Codable {
+    let name: String
+    // Ollama API might return other fields, but we only need 'name'
+    // let modified_at: String
+    // let size: Int
+    // let digest: String
+}
 
 // Define structures to match Ollama's JSON request and response format
 struct OllamaGenerateRequest: Codable {
@@ -17,46 +33,44 @@ struct OllamaGenerateResponse: Codable {
 }
 
 
-@main
-class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate, NSAlertDelegate, NSWindowDelegate {
+// NOTE: No @main here, using main.swift instead
+class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate, NSAlertDelegate, NSWindowDelegate, NSTextFieldDelegate {
 
     // --- Properties ---
     var statusItem: NSStatusItem?
-    var eventTap: CFMachPort?
+    var eventTap: CFMachPort? // Global CGEvent tap
+    var eventTapRunLoopSource: CFRunLoopSource? // Source for the global tap
     var isHotkeyActive: Bool = false
     // Ollama Configuration (user‑configurable)
-    var ollamaModelName: String = "gemma3:4b-it-qat"      // default
+    var ollamaModelName: String = "gemma3:4b-it-qat"     // default - Update this default if needed
     let ollamaApiUrl = URL(string: "http://localhost:11434/api/generate")!
-    var hotkeyCode: CGKeyCode = 49            // Space
-    var hotkeyModifiers: CGEventFlags = .maskControl
+    let ollamaTagsUrl = URL(string: "http://localhost:11434/api/tags")! // URL for listing models
+    var hotkeyCode: CGKeyCode = CGKeyCode(kVK_Space)         // Default: Space (using Carbon constant 49)
+    var hotkeyModifiers: CGEventFlags = .maskControl // Default: Control
     var audioRecorder: AVAudioRecorder?
     var recordingFileURL: URL?
     var isRecording: Bool = false
     // Persisted settings
     let defaults = UserDefaults.standard
-    var awaitingHotkeyCapture = false
-
-    // --- Preferences window UI ---
-    var prefsWindow: NSWindow?
-    var modelTextField: NSTextField?
-    var hotkeyLabel: NSTextField?
-    var changeHotkeyButton: NSButton?
-    var hotkeyMonitor: Any?
+    var awaitingHotkeyCapture = false // Flag to indicate if we are capturing the next key press
 
 
     // --- Application Lifecycle Methods ---
     func applicationDidFinishLaunching(_ aNotification: Notification) {
-        print("App Launched: Setting up status bar item...")
+        print("--- applicationDidFinishLaunching: START ---")
+
+        print("Setting up status bar item...")
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         guard let statusItem = statusItem, let button = statusItem.button else {
             print("Fatal Error: Could not create status bar item or button. Terminating.")
+            print("--- applicationDidFinishLaunching: FAILED (Status Item) ---")
             NSApplication.shared.terminate(self)
             return
         }
         if let image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "WhisperType Idle Status") {
             button.image = image
         } else {
-            button.title = "WT"
+            button.title = "WT" // Fallback title
         }
         button.toolTip = "WhisperType (Initializing)"
         let menu = NSMenu()
@@ -70,38 +84,184 @@ class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate, NSA
         print("Status bar setup complete.")
 
         // Load persisted model / hotkey (if any)
-        if let savedModel = defaults.string(forKey: "OllamaModelName") {
+        if let savedModel = defaults.string(forKey: "OllamaModelName"),
+           !savedModel.isEmpty {
             ollamaModelName = savedModel
+            print("Loaded saved model: \(ollamaModelName)")
+        } else {
+            // If no model saved, try fetching models on launch to set a default if possible
+            // Or just keep the hardcoded default. For simplicity, keep default for now.
+            print("Using default model: \(ollamaModelName)")
         }
-        if let savedKey = defaults.value(forKey: "HotkeyKeyCode") as? UInt64 {
+
+        let savedKey = defaults.integer(forKey: "HotkeyKeyCode")
+        if savedKey != 0 {
             hotkeyCode = CGKeyCode(savedKey)
-        }
-        if let savedMods = defaults.value(forKey: "HotkeyModifiers") as? UInt64 {
-            hotkeyModifiers = CGEventFlags(rawValue: savedMods)
+        } else {
+            hotkeyCode = CGKeyCode(kVK_Space) // Default if not saved
         }
 
+        let savedMods = defaults.integer(forKey: "HotkeyModifiers")
+        if defaults.object(forKey: "HotkeyModifiers") != nil { // Check if key exists, even if 0
+            hotkeyModifiers = CGEventFlags(rawValue: UInt64(savedMods))
+        } else {
+            hotkeyModifiers = .maskControl // Default if not saved
+        }
+        print("Loaded hotkey: Code=\(hotkeyCode), Mods=\(hotkeyModifiers.rawValue)")
+
+
+        // Setup the single global event tap
         checkAndSetupHotkeyListener()
-        print("applicationDidFinishLaunching finished.")
+
+        print("--- applicationDidFinishLaunching: Attempting to activate app ---")
+        NSApp.activate(ignoringOtherApps: true)
+
+        print("--- applicationDidFinishLaunching: FINISHED ---")
     }
-    @objc func quitApp() { print("Quit action triggered from menu."); stopRecording(); disableEventTap(); NSApplication.shared.terminate(self); }
-    func applicationWillTerminate(_ aNotification: Notification) { print("Application will terminate."); stopRecording(); disableEventTap(); }
-    func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { return true }
+
+    @objc func quitApp() {
+        print("Quit action triggered from menu.")
+        stopRecording() // Ensure recording stops
+        disableEventTap() // Cleanly disable the event tap
+        NSApplication.shared.terminate(self)
+    }
+
+    func applicationWillTerminate(_ aNotification: Notification) {
+        print("Application will terminate.")
+        stopRecording() // Ensure recording stops
+        disableEventTap() // Cleanly disable the event tap
+    }
+
+    func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
+        return true
+    }
 
 
-    // --- Permissions and Setup ---
-    func checkAndSetupHotkeyListener() { print("Checking Accessibility Permissions..."); let isTrusted = AXIsProcessTrusted(); if !isTrusted { print("Warning: AXIsProcessTrusted() returned false. Manual grant required.") }; setupEventTap(); }
-    func setupEventTap() { print("Attempting to set up event tap..."); let eventMask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue) | (1 << CGEventType.flagsChanged.rawValue); eventTap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap, eventsOfInterest: CGEventMask(eventMask), callback: { (p, t, e, r) -> Unmanaged<CGEvent>? in guard let r = r else { return Unmanaged.passRetained(e) }; let o = Unmanaged<AppDelegate>.fromOpaque(r).takeUnretainedValue(); return o.handleEvent(proxy: p, type: t, event: e) }, userInfo: Unmanaged.passUnretained(self).toOpaque()); guard let eventTap = eventTap else { print("Error: Failed to create event tap!"); statusItem?.button?.toolTip = "Error: Event Tap Failed!"; return }; print("Event tap created successfully."); let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0); CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes); CGEvent.tapEnable(tap: eventTap, enable: true); print("Event tap enabled. Listening for hotkey (Control+Space)..."); statusItem?.button?.toolTip = "WhisperType (Listening for Control+Space)" }
-    func disableEventTap() { if let tap = eventTap { print("Disabling event tap."); CGEvent.tapEnable(tap: tap, enable: false); eventTap = nil; print("Event tap disabled.") } }
+    // --- Permissions and Global Event Tap Setup ---
+    func checkAndSetupHotkeyListener() {
+        print("Checking Accessibility Permissions...")
+        let isTrusted = AXIsProcessTrusted()
+        if !isTrusted {
+            print("Warning: AXIsProcessTrusted() returned false. Manual grant required in System Settings > Privacy & Security > Accessibility.")
+        }
+        setupEventTap() // Call the setup function
+    }
+
+    // Sets up the single global CGEvent tap
+    func setupEventTap() {
+        disableEventTap() // Clean up old one first
+
+        print("Attempting to set up new event tap...")
+        let eventMask: CGEventMask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue) | (1 << CGEventType.flagsChanged.rawValue)
+        eventTap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: eventMask,
+            callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
+                guard let refcon = refcon else { return Unmanaged.passRetained(event) }
+                let appDelegate = Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue()
+                return appDelegate.handleEvent(proxy: proxy, type: type, event: event)
+            },
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
+        )
+
+        guard let newTap = eventTap else {
+            print("Error: Failed to create event tap! Check Accessibility permissions.")
+            statusItem?.button?.toolTip = "Error: Event Tap Failed! Check Permissions."
+            return
+        }
+        print("New event tap created successfully.")
+
+        guard let newSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, newTap, 0) else {
+             print("Error: Failed to create run loop source for new tap!")
+             self.eventTap = nil
+             statusItem?.button?.toolTip = "Error: Event Tap Source Failed!"
+             return
+        }
+        self.eventTapRunLoopSource = newSource
+        print("New run loop source created and stored.")
+
+        CFRunLoopAddSource(CFRunLoopGetMain(), newSource, .commonModes)
+        print("New run loop source added to main run loop.")
+        CGEvent.tapEnable(tap: newTap, enable: true)
+
+        if !CGEvent.tapIsEnabled(tap: newTap) {
+             print("Error: Failed to enable event tap after creation!")
+             statusItem?.button?.toolTip = "Error: Could not enable event tap."
+             CFRunLoopRemoveSource(CFRunLoopGetMain(), newSource, .commonModes)
+             self.eventTapRunLoopSource = nil
+             self.eventTap = nil
+             return
+        }
+
+        let currentHotkeyText = formatHotkey(code: hotkeyCode, mods: hotkeyModifiers)
+        print("New event tap enabled. Listening for \(currentHotkeyText)...")
+        statusItem?.button?.toolTip = "WhisperType (Listening for \(currentHotkeyText))"
+    }
+
+    // Cleanly disables and removes the global event tap and its source
+    func disableEventTap() {
+        // print("Attempting to disable event tap...") // Less verbose
+        if let tap = eventTap {
+            // print("Disabling existing event tap (CGEvent.tapEnable=false).")
+            CGEvent.tapEnable(tap: tap, enable: false)
+            if let source = eventTapRunLoopSource {
+                // print("Removing existing run loop source.")
+                CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+                eventTapRunLoopSource = nil
+            }
+            eventTap = nil
+            print("Event tap disabled and references cleared.")
+        } else {
+            if eventTapRunLoopSource != nil {
+                 print("Warning: eventTap was nil but source was not. Clearing source.")
+                 eventTapRunLoopSource = nil
+            }
+        }
+    }
 
 
     // --- Audio Recording Methods ---
     func startRecording() { guard !isRecording else { print("Already recording."); return }; print("Attempting to start recording..."); let tempDir = FileManager.default.temporaryDirectory; let fileName = "whisperTypeRecording_\(Date().timeIntervalSince1970).wav"; recordingFileURL = tempDir.appendingPathComponent(fileName); let settings: [String: Any] = [ AVFormatIDKey: Int(kAudioFormatLinearPCM), AVSampleRateKey: 16000, AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false, ]; do { audioRecorder = try AVAudioRecorder(url: recordingFileURL!, settings: settings); audioRecorder?.delegate = self; audioRecorder?.isMeteringEnabled = true; if audioRecorder?.prepareToRecord() == true { audioRecorder?.record(); isRecording = true; print("Recording started (or attempted) to: \(recordingFileURL!.path)") } else { print("Error: Audio recorder failed to prepare."); isRecording = false; recordingFileURL = nil } } catch { print("Error setting up audio recorder: \(error.localizedDescription)"); isRecording = false; recordingFileURL = nil; DispatchQueue.main.async { self.statusItem?.button?.image = NSImage(systemSymbolName: "exclamationmark.circle.fill", accessibilityDescription: "Recording Setup Error"); self.statusItem?.button?.toolTip = "Error: Could not start recorder" } } }
-    func stopRecording() { guard isRecording, let recorder = audioRecorder else { return }; print("Stopping recording..."); recorder.stop(); isRecording = false }
-    func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) { print("audioRecorderDidFinishRecording called. Success: \(flag)"); guard let url = recordingFileURL else { print("Error: Recording finished but file URL is nil."); DispatchQueue.main.async { self.statusItem?.button?.image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "WhisperType Idle Status after Save Error"); self.statusItem?.button?.toolTip = "WhisperType (Error Saving Recording)" }; audioRecorder = nil; return }; if flag { print("Recording saved successfully to: \(url.path)"); transcribeAudio(fileURL: url) } else { print("Error: Recording finished unsuccessfully."); recordingFileURL = nil; DispatchQueue.main.async { self.statusItem?.button?.image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "WhisperType Idle Status after Recording Failure"); self.statusItem?.button?.toolTip = "WhisperType (Recording Failed)" }; try? FileManager.default.removeItem(at: url) }; audioRecorder = nil }
+    func stopRecording() { guard isRecording, let recorder = audioRecorder else { return }; print("Stopping recording..."); recorder.stop(); }
+    func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
+        print("audioRecorderDidFinishRecording called. Success: \(flag)")
+        isRecording = false
+        guard let url = recordingFileURL else {
+            print("Error: Recording finished but file URL is nil.")
+            DispatchQueue.main.async {
+                self.resetUI(showError: true, message: "Recording Save Error")
+            }
+            audioRecorder = nil
+            return
+        }
+        let finishedRecordingURL = url
+        self.recordingFileURL = nil
+
+        DispatchQueue.main.async {
+            if !self.isHotkeyActive && !self.awaitingHotkeyCapture {
+                 self.statusItem?.button?.image = NSImage(systemSymbolName: "hourglass.circle", accessibilityDescription: "Processing Status")
+                 self.statusItem?.button?.toolTip = "WhisperType (Processing)"
+            }
+        }
+
+        if flag {
+            print("Recording saved successfully to: \(finishedRecordingURL.path)")
+            transcribeAudio(fileURL: finishedRecordingURL)
+        } else {
+            print("Error: Recording finished unsuccessfully.")
+            DispatchQueue.main.async {
+                self.resetUI(showError: true, message: "Recording Failed")
+            }
+            try? FileManager.default.removeItem(at: finishedRecordingURL)
+        }
+        audioRecorder = nil
+    }
 
 
     // --- Transcription Function ---
-     func transcribeAudio(fileURL: URL) { print("Attempting to transcribe audio file: \(fileURL.path)"); guard let whisperPath = Bundle.main.path(forResource: "whisper-cli", ofType: nil), let modelPath = Bundle.main.path(forResource: "ggml-base.en", ofType: "bin") else { print("Error: Could not find bundled whisper executable ('whisper-cli') or model file ('ggml-base.en.bin') in app bundle's Resources."); DispatchQueue.main.async { self.statusItem?.button?.image = NSImage(systemSymbolName: "exclamationmark.circle.fill", accessibilityDescription: "Transcription Resource Error"); self.statusItem?.button?.toolTip = "Error: Missing transcription resources!" }; try? FileManager.default.removeItem(at: fileURL); return }; print("Found whisper executable: \(whisperPath)"); print("Found model file: \(modelPath)"); let arguments = [ "-m", modelPath, "-nt", "-l", "en", "-otxt", "-f", fileURL.path ]; let process = Process(); process.executableURL = URL(fileURLWithPath: whisperPath); process.arguments = arguments; let pipe = Pipe(); process.standardOutput = pipe; DispatchQueue.global(qos: .userInitiated).async { do { print("Launching whisper-cli process..."); try process.run(); process.waitUntilExit(); print("whisper-cli process finished with status: \(process.terminationStatus)"); let data = pipe.fileHandleForReading.readDataToEndOfFile(); let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""; DispatchQueue.main.async { if process.terminationStatus == 0 && !output.isEmpty { print("Transcription successful:\n---\n\(output)\n---"); self.sendToOllama(rawText: output) } else { print("Error: Transcription failed. Status: \(process.terminationStatus), Output: '\(output)'"); self.statusItem?.button?.image = NSImage(systemSymbolName: "exclamationmark.circle.fill", accessibilityDescription: "Transcription Failed Error"); self.statusItem?.button?.toolTip = "Error: Transcription failed"; if !self.isHotkeyActive && !self.isRecording { self.resetUI() } }; print("Deleting temporary audio file: \(fileURL.path)"); try? FileManager.default.removeItem(at: fileURL) } } catch { DispatchQueue.main.async { print("Error launching whisper-cli process: \(error)"); self.statusItem?.button?.image = NSImage(systemSymbolName: "exclamationmark.circle.fill", accessibilityDescription: "Transcription Launch Error"); self.statusItem?.button?.toolTip = "Error: Failed to run transcriber"; try? FileManager.default.removeItem(at: fileURL); if !self.isHotkeyActive && !self.isRecording { self.resetUI() } } } } }
+    func transcribeAudio(fileURL: URL) { print("Attempting to transcribe audio file: \(fileURL.path)"); guard let whisperPath = Bundle.main.path(forResource: "whisper-cli", ofType: nil), let modelPath = Bundle.main.path(forResource: "ggml-base.en", ofType: "bin") else { print("Error: Could not find bundled whisper executable ('whisper-cli') or model file ('ggml-base.en.bin') in app bundle's Resources."); DispatchQueue.main.async { self.resetUI(showError: true, message: "Missing transcription resources!") }; try? FileManager.default.removeItem(at: fileURL); return }; print("Found whisper executable: \(whisperPath)"); print("Found model file: \(modelPath)"); let arguments = [ "-m", modelPath, "-nt", "-l", "en", "-otxt", "-f", fileURL.path ]; let process = Process(); process.executableURL = URL(fileURLWithPath: whisperPath); process.arguments = arguments; let pipe = Pipe(); process.standardOutput = pipe; DispatchQueue.global(qos: .userInitiated).async { do { print("Launching whisper-cli process..."); try process.run(); process.waitUntilExit(); print("whisper-cli process finished with status: \(process.terminationStatus)"); let data = pipe.fileHandleForReading.readDataToEndOfFile(); let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""; DispatchQueue.main.async { if process.terminationStatus == 0 && !output.isEmpty { print("Transcription successful:\n---\n\(output)\n---"); self.sendToOllama(rawText: output) } else { print("Error: Transcription failed. Status: \(process.terminationStatus), Output: '\(output)'"); self.resetUI(showError: true, message: "Transcription Failed") }; print("Deleting temporary audio file: \(fileURL.path)"); try? FileManager.default.removeItem(at: fileURL) } } catch { DispatchQueue.main.async { print("Error launching whisper-cli process: \(error)"); self.resetUI(showError: true, message: "Failed to run transcriber"); try? FileManager.default.removeItem(at: fileURL) } } } }
 
 
     // --- Ollama Interaction ---
@@ -111,6 +271,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate, NSA
             self.statusItem?.button?.image = NSImage(systemSymbolName: "brain.head.profile", accessibilityDescription: "Thinking Status")
             self.statusItem?.button?.toolTip = "WhisperType (Thinking...)"
         }
+        // Prompt remains strict
         let prompt = """
         You are WhisperType, a context‑aware writing assistant.
 
@@ -120,11 +281,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate, NSA
         **Rules**
         1. Correct spelling, grammar, and punctuation.
         2. Detect structure:
-           • If the input clearly contains multiple discrete points, short sentences, or list markers (“first…”, “next…”, “finally…”), output a bulleted list.
-           • Otherwise return one or more coherent sentences/paragraphs.
+            • If the input clearly contains multiple discrete points, short sentences, or list markers (“first…”, “next…”, “finally…”), output a bulleted list.
+            • Otherwise return one or more coherent sentences/paragraphs.
         3. Respect any numbers, URLs, code snippets, or email addresses verbatim.
-        4. Never add an introduction or explanation.
-        5. Output only the final text – no code fences, tags, or commentary.
+        4. **CRITICAL:** Output *only* the final, refined text. Do **NOT** include any explanations, introductions, commentary, meta-tags like `<think>`, or code fences (```). Your entire response must be *only* the text to be inserted.
 
         **Input**
 
@@ -134,6 +294,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate, NSA
 
         **Output**
         """
+
         let requestBody = OllamaGenerateRequest(model: ollamaModelName, prompt: prompt)
         guard let encodedBody = try? JSONEncoder().encode(requestBody) else {
             print("Error: Failed to encode Ollama request body.")
@@ -164,22 +325,35 @@ class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate, NSA
                 }
                 do {
                     let ollamaResponse = try JSONDecoder().decode(OllamaGenerateResponse.self, from: data)
-                    let fullResponse = ollamaResponse.response
-                    var refinedText: String
-                    if let lastThinkTagRange = fullResponse.range(of: "</think>", options: .backwards) {
-                        refinedText = String(fullResponse[lastThinkTagRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
-                        print("Extracted text after </think> tag.")
+                    print("Received raw response from Ollama.") // Log before processing
+
+                    // --- Post-processing to remove <think> tags ---
+                    var processedText = ollamaResponse.response
+                    // Use regular expression to find and remove <think>...</think> blocks
+                    // The regex: "<think>": Matches the opening tag.
+                    //            ".*?": Matches any character (.), zero or more times (*), non-greedily (?).
+                    //            "</think>": Matches the closing tag.
+                    // options: .dotMatchesLineSeparators allows '.' to match newline characters within the block.
+                    if let regex = try? NSRegularExpression(pattern: "<think>.*?</think>", options: .dotMatchesLineSeparators) {
+                        let range = NSRange(processedText.startIndex..., in: processedText)
+                        // Replace found ranges with an empty string
+                        processedText = regex.stringByReplacingMatches(in: processedText, options: [], range: range, withTemplate: "")
+                        print("Applied regex to remove <think> tags.")
                     } else {
-                        refinedText = fullResponse.trimmingCharacters(in: .whitespacesAndNewlines)
-                        print("No </think> tag found, using full response.")
+                        print("Warning: Could not create regex for <think> tags.")
                     }
+                    // Trim whitespace after potentially removing tags
+                    let refinedText = processedText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    // --- End Post-processing ---
+
+
                     if refinedText.isEmpty {
-                        print("Error: Ollama returned empty refined text.")
+                        print("Error: Ollama returned empty refined text after processing.")
                         self.resetUI(showError: true, message: "Ollama Empty Response")
                         return
                     }
                     print("Ollama refinement successful (processed):\n---\n\(refinedText)\n---")
-                    self.insertRefinedText(text: refinedText) // Pass final text
+                    self.insertRefinedText(text: refinedText)
                 } catch {
                     print("Error decoding Ollama response JSON: \(error)")
                     print("Raw Ollama response: \(String(data: data, encoding: .utf8) ?? "Unable to decode raw response")")
@@ -190,53 +364,43 @@ class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate, NSA
         task.resume()
     }
 
-    // --- Text Insertion Implementation (Accessibility with key‑event fallback) ---
+    // --- Text Insertion Implementation ---
     func insertRefinedText(text: String) {
-        // Always ensure one trailing space so successive inserts are separated
         let insertionText = text.hasSuffix(" ") || text.hasSuffix("\n") ? text : text + " "
         print("Attempting to insert via Accessibility…")
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {       // let focus settle
-            // 1️⃣ system‑wide focused UI element (works for Chrome/Electron)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
             let systemWide = AXUIElementCreateSystemWide()
             var focused: AnyObject?
             let err = AXUIElementCopyAttributeValue(systemWide,
                                                     kAXFocusedUIElementAttribute as CFString,
                                                     &focused)
 
-            // Ensure we received an element; if not, fall back to simulated typing.
             guard err == .success, let anyElement = focused else {
-                print("Couldn’t get focused element (\(err.rawValue)); falling back to typing.")
-                self.typeText(insertionText)        // see helper below
-                self.resetUI()
+                print("Couldn’t get focused element (AXError code: \(err.rawValue)); falling back to typing.")
+                self.typeText(insertionText)
                 return
             }
 
-            // CoreFoundation bridging guarantees the object is an AXUIElement,
-            // so we can safely force‑cast without triggering the “conditional
-            // downcast … will always succeed” warning.
             let axElement = anyElement as! AXUIElement
 
-            // 2️⃣ Try to insert without replacing the whole field
             var settable: DarwinBoolean = false
             if AXUIElementIsAttributeSettable(axElement,
                                               kAXValueAttribute as CFString,
                                               &settable) == .success,
                settable.boolValue {
 
-                // — a. Get current text
                 var currentValueCF: CFTypeRef?
                 let gotValue = AXUIElementCopyAttributeValue(axElement,
                                                              kAXValueAttribute as CFString,
                                                              &currentValueCF)
+
                 guard gotValue == .success, let currentText = currentValueCF as? String else {
                     print("Could not read current value – falling back to typing.")
                     self.typeText(insertionText)
-                    self.resetUI()
                     return
                 }
 
-                // — b. Get current caret / selection range
                 var selRangeCF: CFTypeRef?
                 let gotSel = AXUIElementCopyAttributeValue(axElement,
                                                            kAXSelectedTextRangeAttribute as CFString,
@@ -250,65 +414,95 @@ class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate, NSA
                    AXValueGetType(selAXValue as! AXValue) == .cfRange {
 
                     var cfRange = CFRange()
-                    AXValueGetValue(selAXValue as! AXValue, .cfRange, &cfRange)
-                    let nsRange = NSRange(location: cfRange.location, length: cfRange.length)
+                    if AXValueGetValue(selAXValue as! AXValue, .cfRange, &cfRange) {
+                        let rangeLocation = cfRange.location == kCFNotFound ? 0 : cfRange.location
+                        let rangeLength = cfRange.length
 
-                    // Replace selected range (or insert at caret if length == 0)
-                    if let mutable = currentText.mutableCopy() as? NSMutableString {
-                        mutable.replaceCharacters(in: nsRange, with: insertionText)
-                        newString = mutable as String
+                        if let validRange = Range(NSRange(location: rangeLocation, length: rangeLength), in: currentText) {
+                            print("Valid selection range found. Replacing...")
+                            let nsRange = NSRange(validRange, in: currentText)
+                            if let mutable = currentText.mutableCopy() as? NSMutableString {
+                                mutable.replaceCharacters(in: nsRange, with: insertionText)
+                                newString = mutable as String
+                            } else {
+                                newString = (currentText as NSString).replacingCharacters(in: nsRange, with: insertionText)
+                            }
+                            print("Calculated newString (replace): \(newString)")
+                        } else {
+                            print("Invalid selection range (\(rangeLocation), \(rangeLength)) for text length \(currentText.count) - appending.")
+                            newString = currentText + insertionText
+                            print("Calculated newString (append): \(newString)")
+                        }
+
                     } else {
-                        // Shouldn’t happen, but be safe
-                        newString = (currentText as NSString).replacingCharacters(in: nsRange, with: insertionText)
+                         print("Could not extract CFRange from AXValue – appending.")
+                         newString = currentText + insertionText
                     }
                 } else {
-                    // Couldn’t get selection – append at end (less ideal but safe)
+                    print("Could not get selection range or it wasn't a CFRange – appending.")
                     newString = currentText + insertionText
                 }
 
-                // — c. Write back
+                print("Attempting AXUIElementSetAttributeValue with: \(newString)")
                 if AXUIElementSetAttributeValue(axElement,
                                                 kAXValueAttribute as CFString,
                                                 newString as CFTypeRef) == .success {
-                    print("Inserted without overwriting existing content ✓")
+                    print("Inserted via AXUIElementSetAttributeValue ✓")
                     self.resetUI()
                     return
                 } else {
-                    print("Set value failed; falling back to typing.")
-                    // fall through to 3️⃣
+                    print("AXUIElementSetAttributeValue failed; falling back.")
                 }
+            } else {
+                 print("AXValueAttribute not settable; falling back.")
             }
 
-            // 3️⃣ Otherwise simulate real keystrokes (clipboard‑safe)
-            print("AXValue not settable; falling back to typing.")
+            if insertionText.count > 40 {
+                self.insertViaPasteboard(text: insertionText)
+                return
+            }
+
+            print("Falling back to typing simulation.")
             self.typeText(insertionText)
-            self.resetUI()
         }
     }
 
-    // --- Fallback: type characters via Quartz events ---
+    // --- REVERTED typeText to use CGEvent directly ---
     func typeText(_ text: String) {
-        let src = CGEventSource(stateID: .hidSystemState)
+        print("Starting CGEvent typing simulation...")
+        let source = CGEventSource(stateID: .hidSystemState)
+        guard let source = source else {
+            print("Error: Could not create event source for typing.")
+            resetUI(showError: true, message: "Typing Event Error")
+            return
+        }
+
         for scalar in text.unicodeScalars {
-            var u = UInt16(scalar.value)
-            // keyDown with Unicode payload
-            if let kd = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true) {
-                kd.keyboardSetUnicodeString(stringLength: 1, unicodeString: &u)
-                kd.post(tap: .cgSessionEventTap)
+            var utf16Chars = [UniChar]()
+            utf16Chars.append(contentsOf: String(scalar).utf16)
+
+            if let keyDownEvent = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true) {
+                keyDownEvent.keyboardSetUnicodeString(stringLength: utf16Chars.count, unicodeString: &utf16Chars)
+                keyDownEvent.post(tap: .cgSessionEventTap)
+            } else {
+                print("Warning: Could not create keyDown CGEvent for scalar \(scalar)")
             }
-            // keyUp
-            if let ku = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) {
-                ku.post(tap: .cgSessionEventTap)
+
+            if let keyUpEvent = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) {
+                keyUpEvent.post(tap: .cgSessionEventTap)
+            } else {
+                print("Warning: Could not create keyUp CGEvent for scalar \(scalar)")
             }
         }
+        print("Finished CGEvent typing simulation.")
+        resetUI()
     }
-    
-    // --- Separate function for Pasteboard Insertion ---
+
+    // (Keep your existing insertViaPasteboard method)
     func insertViaPasteboard(text: String) {
         print("Using Pasteboard fallback method...")
-
-        // 1. Clear and set pasteboard
         let pasteboard = NSPasteboard.general
+
         pasteboard.clearContents()
         guard pasteboard.setString(text, forType: .string) else {
             print("Error: Failed to set string on pasteboard.")
@@ -317,329 +511,469 @@ class AppDelegate: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate, NSA
         }
         print("Text copied to pasteboard (clipboard overwritten).")
 
-        // 2. Simulate Cmd+V
-        // Give a tiny delay AFTER setting pasteboard
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { // 0.1s delay seems sufficient usually
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             print("Simulating Cmd+V keystroke...")
             let source = CGEventSource(stateID: .hidSystemState)
-            // Key codes: Cmd=55, V=9
-            let keyVDown = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true)
-            let keyVUp = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false)
-            keyVDown?.flags = .maskCommand
-            keyVUp?.flags = .maskCommand
-            keyVDown?.post(tap: .cgSessionEventTap)
-            keyVUp?.post(tap: .cgSessionEventTap)
+            guard let source = source else {
+                print("Error: Could not create event source for paste.")
+                self.resetUI(showError: true, message: "Paste Event Error")
+                return
+            }
+
+            let keyVDown = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: true)
+            let keyVUp = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_V), keyDown: false)
+
+            guard let keyVDown = keyVDown, let keyVUp = keyVUp else {
+                 print("Error: Could not create Cmd+V key events.")
+                 self.resetUI(showError: true, message: "Paste Event Error")
+                 return
+            }
+
+            keyVDown.flags = .maskCommand
+            keyVUp.flags = .maskCommand
+
+            keyVDown.post(tap: .cgSessionEventTap)
+            keyVUp.post(tap: .cgSessionEventTap)
             print("Cmd+V simulation posted.")
-            self.resetUI() // Reset UI after paste attempt
+
+             self.resetUI()
         }
+    }
+
+
+    // MARK: - Hot‑key updater (If using KeyboardShortcuts library elsewhere)
+    func updateHotkey(to sc: KeyboardShortcuts.Shortcut) {
+        print("Updating hotkey via KeyboardShortcuts.Shortcut")
+        if let key = sc.key {
+            hotkeyCode = CGKeyCode(key.rawValue)
+        } else {
+             print("Warning: KeyboardShortcuts.Shortcut had nil key.")
+        }
+        hotkeyModifiers = CGEventFlags(rawValue: UInt64(sc.modifiers.rawValue))
+
+        defaults.set(Int(hotkeyCode), forKey: "HotkeyKeyCode")
+        defaults.set(Int(hotkeyModifiers.rawValue), forKey: "HotkeyModifiers")
+        print("Persisted new hotkey from KeyboardShortcuts: Code=\(hotkeyCode), Mods=\(hotkeyModifiers.rawValue)")
+
+        let formattedHotkey = formatHotkey(code: hotkeyCode, mods: hotkeyModifiers)
+        statusItem?.button?.toolTip = "WhisperType (Listening for \(formattedHotkey))"
     }
 
 
     // --- Helper to Reset UI ---
     func resetUI(showError: Bool = false, message: String? = nil) {
         DispatchQueue.main.async {
-            if !self.isHotkeyActive && !self.isRecording {
-                if showError { self.statusItem?.button?.image = NSImage(systemSymbolName: "exclamationmark.circle.fill", accessibilityDescription: "Error Status"); self.statusItem?.button?.toolTip = "Error: \(message ?? "Unknown Error")"; DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { self.resetUI() } }
-                else { self.statusItem?.button?.image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "WhisperType Idle Status"); self.statusItem?.button?.toolTip = "WhisperType (Listening for Control+Space)" }
+            if !self.isHotkeyActive && !self.isRecording && !self.awaitingHotkeyCapture {
+                if showError {
+                    self.statusItem?.button?.image = NSImage(systemSymbolName: "exclamationmark.circle.fill", accessibilityDescription: "Error Status")
+                    self.statusItem?.button?.toolTip = "Error: \(message ?? "Unknown Error")"
+                    print("UI Reset: Showing Error - \(message ?? "Unknown Error")")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                        if !self.isHotkeyActive && !self.isRecording && !self.awaitingHotkeyCapture {
+                           self.resetUI()
+                        }
+                    }
+                } else {
+                    let currentHotkeyText = self.formatHotkey(code: self.hotkeyCode, mods: self.hotkeyModifiers)
+                    self.statusItem?.button?.image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "WhisperType Idle Status")
+                    self.statusItem?.button?.toolTip = "WhisperType (Listening for \(currentHotkeyText))"
+                    print("UI Reset: Now Listening for \(currentHotkeyText)")
+                }
+            } else {
+                var stateReason = [String]()
+                if self.isHotkeyActive { stateReason.append("Hotkey Active") }
+                if self.isRecording { stateReason.append("Recording") }
+                if self.awaitingHotkeyCapture { stateReason.append("Awaiting Capture") }
+                print("resetUI called but state prevents immediate reset: \(stateReason.joined(separator: ", ")). Ignoring for now.")
             }
         }
     }
 
 
-    // --- Event Handling ---
+    // --- Unified Event Handling (Callback for the Global CGEvent Tap) ---
     func handleEvent(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
-        // --- Hotkey capture mode ---
-        if awaitingHotkeyCapture && type == .keyDown {
-            let newCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
-            let newMods = event.flags.intersection([.maskCommand, .maskControl, .maskShift, .maskAlternate])
-            hotkeyCode = newCode
-            hotkeyModifiers = newMods
-            defaults.set(UInt64(newCode), forKey: "HotkeyKeyCode")
-            defaults.set(newMods.rawValue, forKey: "HotkeyModifiers")
-            awaitingHotkeyCapture = false
-            print("New hotkey set: \(newMods) + \(newCode)")
-            statusItem?.button?.toolTip = "WhisperType (Listening for new hotkey)"
-            return Unmanaged.passUnretained(event)   // don’t treat it as a whisper trigger
+
+        // --- Section 1: Hotkey Capture Logic ---
+        if awaitingHotkeyCapture {
+            if type == .keyDown {
+                let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
+                let flags = event.flags
+                print("handleEvent: Capture mode detected keyDown: Code=\(keyCode), Flags=\(flags.rawValue)")
+
+                if keyCode == kVK_Escape {
+                    awaitingHotkeyCapture = false
+                    print("Hotkey capture cancelled by Escape key.")
+                    DispatchQueue.main.async {
+                        self.resetUI()
+                    }
+                    return nil
+                }
+
+                let capturedModifiers = flags.intersection([.maskCommand, .maskShift, .maskControl, .maskAlternate, .maskSecondaryFn])
+
+                self.hotkeyCode = keyCode
+                self.hotkeyModifiers = capturedModifiers
+                self.defaults.set(Int(keyCode), forKey: "HotkeyKeyCode")
+                self.defaults.set(Int(capturedModifiers.rawValue), forKey: "HotkeyModifiers")
+                let formattedHotkey = self.formatHotkey(code: keyCode, mods: capturedModifiers)
+                print("Captured new hotkey via global tap: \(formattedHotkey)")
+
+                awaitingHotkeyCapture = false
+
+                DispatchQueue.main.async {
+                    let confirm = NSAlert()
+                    confirm.messageText = "Hotkey Updated"
+                    confirm.informativeText = "New hotkey: \(formattedHotkey)"
+                    confirm.addButton(withTitle: "OK")
+                    NSApp.activate(ignoringOtherApps: true)
+                    confirm.runModal()
+                    self.resetUI()
+                    print("Global tap remains active. Now listening for \(formattedHotkey).")
+                }
+                return nil
+            }
+             if type == .flagsChanged || type == .keyUp {
+                 return nil
+             }
+            return Unmanaged.passUnretained(event)
         }
+
+        // --- Section 2: Normal Hotkey Operation Logic ---
+        guard type == .keyDown || type == .keyUp || type == .flagsChanged else {
+            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                print("Event tap disabled (\(type == .tapDisabledByTimeout ? "Timeout" : "UserInput")). Attempting to re-enable.")
+                if let tap = self.eventTap {
+                   CGEvent.tapEnable(tap: tap, enable: true)
+                   if !CGEvent.tapIsEnabled(tap: tap) {
+                       print("Error: Failed to re-enable event tap. Resetting.")
+                       self.checkAndSetupHotkeyListener()
+                   } else {
+                       print("Event tap re-enabled successfully.")
+                   }
+                } else {
+                   print("Event tap was nil, cannot re-enable. Attempting full setup.")
+                   self.checkAndSetupHotkeyListener()
+                }
+            }
+            return Unmanaged.passUnretained(event)
+        }
+
+        let currentKeyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
+        let currentFlags = event.flags
+
         if type == .keyDown {
-            let k = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
-            let f = event.flags
-            let c = f.contains(hotkeyModifiers)
-            if k == hotkeyCode && c {
-                if !isHotkeyActive {
+            if !isHotkeyActive && currentKeyCode == hotkeyCode && currentFlags.contains(hotkeyModifiers) {
+                let relevantFlags = currentFlags.intersection([.maskCommand, .maskShift, .maskControl, .maskAlternate, .maskSecondaryFn])
+                if relevantFlags == hotkeyModifiers {
                     isHotkeyActive = true
-                    print("Hotkey PRESSED (Control+Space)")
+                    let formattedHotkey = self.formatHotkey(code: hotkeyCode, mods: hotkeyModifiers)
+                    print("Hotkey PRESSED: \(formattedHotkey)")
                     DispatchQueue.main.async {
                         self.statusItem?.button?.image = NSImage(systemSymbolName: "mic.circle.fill", accessibilityDescription: "Recording Status")
                         self.statusItem?.button?.toolTip = "WhisperType (Recording)"
                         self.startRecording()
                     }
-                    print("Consuming hotkey event to prevent beep.")
-                    return nil
-                } else {
                     return nil
                 }
+            } else if isHotkeyActive {
+                return nil
             }
         }
-        else if type == .keyUp || type == .flagsChanged {
-            if isHotkeyActive {
-                let k = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
-                let f = event.flags
-                let c = f.contains(hotkeyModifiers)
-                if (type == .keyUp && k == hotkeyCode) || !c {
-                    isHotkeyActive = false
-                    print("Hotkey RELEASED (Control+Space)")
-                    DispatchQueue.main.async {
-                        self.statusItem?.button?.image = NSImage(systemSymbolName: "hourglass.circle", accessibilityDescription: "Processing Status")
-                        self.statusItem?.button?.toolTip = "WhisperType (Processing)"
-                        self.stopRecording()
-                    }
-                }
-            }
-        }
-        else if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            print("Event tap disabled. Attempting to re-enable.")
-            if let tap = self.eventTap {
-                CGEvent.tapEnable(tap: tap, enable: true)
+        else if isHotkeyActive && (type == .keyUp || type == .flagsChanged) {
+            let keyReleased = (type == .keyUp && currentKeyCode == hotkeyCode)
+            let modifiersNoLongerMatch = !currentFlags.contains(self.hotkeyModifiers)
+
+            if keyReleased || modifiersNoLongerMatch {
+                 isHotkeyActive = false
+                 let formattedHotkey = self.formatHotkey(code: hotkeyCode, mods: hotkeyModifiers)
+                 print("Hotkey RELEASED: \(formattedHotkey) (Trigger: \(keyReleased ? "Key Up (\(currentKeyCode))" : "Flags Changed"))")
+
+                 DispatchQueue.main.async {
+                     self.stopRecording()
+                     self.resetUI()
+                 }
+
+                 if keyReleased {
+                     print("Consuming hotkey keyUp event.")
+                     return nil
+                 }
+                 if modifiersNoLongerMatch && type == .flagsChanged {
+                      print("Consuming flagsChanged event that released hotkey.")
+                      return nil
+                 }
             }
         }
         return Unmanaged.passUnretained(event)
     }
 
-    // MARK: - Settings helpers
 
-    /// Prompt user to type an Ollama model name (e.g. "quinn:7b")
+    // MARK: - Preferences UI
+    @objc func showPreferences() {
+        let alert = NSAlert()
+        alert.messageText = "WhisperType Preferences"
+        alert.informativeText = "Set your Ollama model and hotkey."
+        alert.addButton(withTitle: "Set Model…") // NSApplication.ModalResponse.alertFirstButtonReturn
+        alert.addButton(withTitle: "Set Hotkey…")// NSApplication.ModalResponse.alertSecondButtonReturn
+        alert.addButton(withTitle: "Cancel")     // NSApplication.ModalResponse.alertThirdButtonReturn
+        NSApp.activate(ignoringOtherApps: true) // Ensure alert is frontmost
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn { // Set Model
+            self.promptModel()
+        } else if response == .alertSecondButtonReturn { // Set Hotkey
+           beginInlineHotkeyCapture() // Call the simplified capture initiation
+        }
+    }
+
+    // --- Fetch Ollama Models ---
+    func fetchOllamaModels(completion: @escaping (Result<[String], Error>) -> Void) {
+        print("Fetching Ollama models from \(ollamaTagsUrl)...")
+        let request = URLRequest(url: ollamaTagsUrl) // Use GET by default
+
+        let task = URLSession.shared.dataTask(with: request) { data, response, error in
+            // Ensure completion handler is called on the main thread for UI updates
+            DispatchQueue.main.async {
+                if let error = error {
+                    print("Error fetching Ollama tags: \(error.localizedDescription)")
+                    completion(.failure(error))
+                    return
+                }
+                guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
+                    let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+                    print("Error: Ollama tags endpoint returned status code \(statusCode)")
+                    let statusError = NSError(domain: "OllamaAPIError", code: statusCode, userInfo: [NSLocalizedDescriptionKey: "Failed to fetch models (status code: \(statusCode))"])
+                    completion(.failure(statusError))
+                    return
+                }
+                guard let data = data else {
+                    print("Error: No data received from Ollama tags endpoint.")
+                    let noDataError = NSError(domain: "OllamaAPIError", code: -1, userInfo: [NSLocalizedDescriptionKey: "No data received from Ollama tags endpoint."])
+                    completion(.failure(noDataError))
+                    return
+                }
+
+                do {
+                    let decoder = JSONDecoder()
+                    let tagsResponse = try decoder.decode(OllamaTagsResponse.self, from: data)
+                    let modelNames = tagsResponse.models.map { $0.name }.sorted() // Extract names and sort
+                    print("Successfully fetched \(modelNames.count) models.")
+                    completion(.success(modelNames))
+                } catch {
+                    print("Error decoding Ollama tags response: \(error)")
+                    completion(.failure(error))
+                }
+            }
+        }
+        task.resume()
+    }
+
+    // --- UPDATED Model Prompt with Dropdown ---
     @objc func promptModel() {
         let alert = NSAlert()
         alert.messageText = "Set Ollama Model"
-        alert.informativeText = "Enter the Ollama model name to use:"
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-        field.stringValue = ollamaModelName
-        alert.showsHelp = true
-        alert.helpAnchor = "OllamaModel"
-        alert.delegate = self
-        alert.accessoryView = field
-        alert.addButton(withTitle: "OK")
-        alert.addButton(withTitle: "Cancel")
-        if alert.runModal() == .alertFirstButtonReturn {
-            let model = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !model.isEmpty {
-                ollamaModelName = model
-                defaults.set(model, forKey: "OllamaModelName")
-            }
-        }
-    }
+        alert.informativeText = "Select the Ollama model to use:"
+        alert.addButton(withTitle: "OK")     // NSApplication.ModalResponse.alertFirstButtonReturn
+        alert.addButton(withTitle: "Cancel") // NSApplication.ModalResponse.alertSecondButtonReturn
 
-    /// Begin capture of a new hot‑key; now replaced by Preferences window.
-    @objc func beginHotkeyCapture() {
-        showPreferences()
-    }
+        // Create the PopUpButton
+        let popUpButton = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 240, height: 25), pullsDown: false) // Standard height
+        popUpButton.addItems(withTitles: ["Fetching models..."]) // Placeholder
+        popUpButton.isEnabled = false // Disable until models are loaded
 
-    // MARK: - Preferences UI -------------------------------------------------
+        alert.accessoryView = popUpButton
 
-    @objc func showPreferences() {
-        if let win = prefsWindow {
-            win.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            return
-        }
-
-        // Window skeleton
-        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 200),
-                           styleMask: [.titled, .closable],
-                           backing: .buffered,
-                           defer: false)
-        win.title = "WhisperType Preferences"
-        win.center()
-        win.delegate = self
-        self.prefsWindow = win
-
-        // --- Model field ---------------------------------------------------
-        let modelLabel = NSTextField(labelWithString: "Ollama Model:")
-        modelLabel.frame = NSRect(x: 20, y: 140, width: 120, height: 20)
-        modelLabel.alignment = .right
-
-        let modelField = NSTextField(frame: NSRect(x: 150, y: 136, width: 240, height: 24))
-        modelField.stringValue = ollamaModelName
-        self.modelTextField = modelField
-
-        // --- Hot‑key selector ----------------------------------------------
-        let hotLabel = NSTextField(labelWithString: "Hotkey:")
-        hotLabel.frame = NSRect(x: 20, y: 100, width: 120, height: 20)
-        hotLabel.alignment = .right
-
-        let hkLabel = NSTextField(labelWithString: formatHotkey(code: hotkeyCode, mods: hotkeyModifiers))
-        hkLabel.frame = NSRect(x: 150, y: 100, width: 150, height: 20)
-        self.hotkeyLabel = hkLabel
-
-        let changeBtn = NSButton(title: "Change…", target: self, action: #selector(beginInlineHotkeyCapture))
-        changeBtn.frame = NSRect(x: 310, y: 96, width: 80, height: 28)
-        self.changeHotkeyButton = changeBtn
-
-        // --- Done (apply) and Cancel buttons -------------------------------
-        let doneBtn = NSButton(title: "Done", target: self, action: #selector(savePreferences))
-        doneBtn.frame = NSRect(x: 310, y: 20, width: 80, height: 30)
-
-        let cancelBtn = NSButton(title: "Cancel", target: self, action: #selector(cancelPreferences))
-        cancelBtn.frame = NSRect(x: 220, y: 20, width: 80, height: 30)
-
-        win.contentView?.addSubview(modelLabel)
-        win.contentView?.addSubview(modelField)
-        win.contentView?.addSubview(hotLabel)
-        win.contentView?.addSubview(hkLabel)
-        win.contentView?.addSubview(changeBtn)
-        win.contentView?.addSubview(cancelBtn)
-        win.contentView?.addSubview(doneBtn)
-
-        win.makeKeyAndOrderFront(nil)
+        // Activate app to bring alert window forward
         NSApp.activate(ignoringOtherApps: true)
-    }
+        // Set focus to the popup button initially
+        alert.window.initialFirstResponder = popUpButton
 
-    /// Apply changes and close the preferences window.
-    @objc func savePreferences() {
-        // Persist model (empty → ignore)
-        if let text = modelTextField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
-           !text.isEmpty {
-            ollamaModelName = text
-            defaults.set(text, forKey: "OllamaModelName")
-        }
-        // The window delegate will finish cleanup
-        prefsWindow?.performClose(nil)
-    }
+        // Fetch models asynchronously
+        fetchOllamaModels { [weak self, weak popUpButton] result in
+            guard let self = self, let popUpButton = popUpButton else { return }
 
-    /// Close the preferences window without applying changes
-    @objc func cancelPreferences() {
-        prefsWindow?.performClose(nil)
-    }
+            popUpButton.removeAllItems() // Clear placeholder/previous items
 
-    // MARK: - NSWindowDelegate
-    func windowWillClose(_ notification: Notification) {
-        guard let win = notification.object as? NSWindow, win == prefsWindow else { return }
-
-        // Clear stored reference so the next “Preferences…” recreates a fresh window
-        prefsWindow = nil
-
-        // If user closed the window while capturing a hot‑key,
-        // cancel capture and remove the local event monitor safely.
-        if awaitingHotkeyCapture {
-            awaitingHotkeyCapture = false
-            if let monitor = hotkeyMonitor {
-                NSEvent.removeMonitor(monitor)
-                hotkeyMonitor = nil
+            switch result {
+            case .success(let modelNames):
+                if modelNames.isEmpty {
+                    popUpButton.addItem(withTitle: "No models found")
+                    popUpButton.isEnabled = false
+                } else {
+                    popUpButton.addItems(withTitles: modelNames)
+                    popUpButton.isEnabled = true
+                    // Try to pre-select the current model
+                    if popUpButton.item(withTitle: self.ollamaModelName) != nil {
+                        popUpButton.selectItem(withTitle: self.ollamaModelName)
+                    } else if let firstModel = modelNames.first {
+                        // If current model not found, select the first available one
+                        popUpButton.selectItem(withTitle: firstModel)
+                        print("Current model '\(self.ollamaModelName)' not found in list, selecting first: '\(firstModel)'")
+                    }
+                }
+            case .failure(let error):
+                print("Failed to populate models: \(error.localizedDescription)")
+                popUpButton.addItem(withTitle: "Error fetching models")
+                popUpButton.isEnabled = false
             }
-            // Restore label to currently active hotkey
-            hotkeyLabel?.stringValue = formatHotkey(code: hotkeyCode, mods: hotkeyModifiers)
-        }
-        // Release UI references to avoid dangling pointers
-        modelTextField = nil
-        hotkeyLabel = nil
-        changeHotkeyButton = nil
-    }
+        } // End fetchOllamaModels completion handler
 
-    // Begin capturing a new hot‑key inside the preferences panel
+        // Run the modal alert
+        let response = alert.runModal()
+
+        if response == .alertFirstButtonReturn { // OK pressed
+            if let selectedModel = popUpButton.titleOfSelectedItem,
+               popUpButton.isEnabled { // Ensure a valid model was selectable
+                if selectedModel != self.ollamaModelName {
+                    self.ollamaModelName = selectedModel
+                    self.defaults.set(selectedModel, forKey: "OllamaModelName")
+                    print("Ollama model updated to: \(selectedModel)")
+                } else {
+                    print("Selected model is the same as the current one.")
+                }
+            } else {
+                 print("No valid model selected or available.")
+            }
+        } else {
+             print("Model selection cancelled.")
+        }
+    } // End promptModel
+
+
+    // --- Updated Hotkey Capture Initiation ---
     @objc func beginInlineHotkeyCapture() {
-        hotkeyLabel?.stringValue = "Press new keys…"
-        awaitingHotkeyCapture = true
+        let info = NSAlert()
+        info.messageText = "Set New Hotkey"
+        info.informativeText = "Click 'Start Capture', then press the exact key combination you want to use.\n\n(Press the Escape key to cancel during capture)"
+        info.addButton(withTitle: "Start Capture") // 1000
+        info.addButton(withTitle: "Cancel")      // 1001
 
-        // Local NSEvent monitor → captures only while prefs window is key
-        hotkeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] ev in
-            guard let self = self, self.awaitingHotkeyCapture else { return ev }
-            self.captureHotkey(from: ev)
-            return nil   // swallow event so it doesn’t beep
+        NSApp.activate(ignoringOtherApps: true)
+
+        let response = info.runModal()
+        print("Set Hotkey info alert dismissed with response code: \(response.rawValue)")
+
+        if response == .alertFirstButtonReturn { // 1000 = Start Capture
+             awaitingHotkeyCapture = true
+             print("Awaiting hotkey capture via global event tap... (awaitingHotkeyCapture = \(awaitingHotkeyCapture))")
+
+             DispatchQueue.main.async {
+                 print("Updating UI for capture mode...")
+                 self.statusItem?.button?.toolTip = "Press desired hotkey (Esc to cancel)"
+                 self.statusItem?.button?.image = NSImage(systemSymbolName: "keyboard", accessibilityDescription: "Capturing Hotkey")
+             }
+        } else {
+             print("Hotkey capture initiation cancelled by user.")
         }
     }
 
-    private func captureHotkey(from event: NSEvent) {
-        awaitingHotkeyCapture = false
 
-        // Remove the temporary local monitor exactly once
-        if let monitor = hotkeyMonitor {
-            NSEvent.removeMonitor(monitor)
-            hotkeyMonitor = nil
-        }
-
-        // Store new key‑code
-        hotkeyCode = CGKeyCode(event.keyCode)
-
-        // Translate NSEvent.ModifierFlags → CGEventFlags
-        let nseMods = event.modifierFlags.intersection([.command, .shift, .control, .option])
-        var cgMods: CGEventFlags = []
-        if nseMods.contains(.command)  { cgMods.insert(.maskCommand) }
-        if nseMods.contains(.shift)    { cgMods.insert(.maskShift) }
-        if nseMods.contains(.control)  { cgMods.insert(.maskControl) }
-        if nseMods.contains(.option)   { cgMods.insert(.maskAlternate) }
-        hotkeyModifiers = cgMods
-
-        // Persist to UserDefaults
-        defaults.set(UInt64(hotkeyCode), forKey: "HotkeyKeyCode")
-        defaults.set(hotkeyModifiers.rawValue, forKey: "HotkeyModifiers")
-
-        // Update label if prefs window still open
-        hotkeyLabel?.stringValue = formatHotkey(code: hotkeyCode, mods: hotkeyModifiers)
-
-        // Notify user
-        let alert = NSAlert()
-        alert.messageText = "Hotkey Updated"
-        alert.informativeText = "New hotkey: \(formatHotkey(code: hotkeyCode, mods: hotkeyModifiers))"
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
-    }
-
+    // --- Hotkey Formatting Helper ---
     private func formatHotkey(code: CGKeyCode, mods: CGEventFlags) -> String {
         var pieces: [String] = []
-        if mods.contains(.maskControl)   { pieces.append("⌃") }
-        if mods.contains(.maskAlternate) { pieces.append("⌥") }
-        if mods.contains(.maskShift)     { pieces.append("⇧") }
-        if mods.contains(.maskCommand)   { pieces.append("⌘") }
+        if mods.contains(.maskControl)   { pieces.append("⌃") } // Control
+        if mods.contains(.maskAlternate) { pieces.append("⌥") } // Option/Alt
+        if mods.contains(.maskShift)     { pieces.append("⇧") } // Shift
+        if mods.contains(.maskCommand)   { pieces.append("⌘") } // Command
 
-        let keyName: String
-        switch code {
-        case 49:  keyName = "Space"
-        case 53:  keyName = "Esc"
-        case 36:  keyName = "Return"
-        case 122: keyName = "F1"
-        case 120: keyName = "F2"
-        case 99:  keyName = "F3"
-        case 118: keyName = "F4"
-        case 96:  keyName = "F5"
-        case 97:  keyName = "F6"
-        case 98:  keyName = "F7"
-        case 100: keyName = "F8"
-        case 101: keyName = "F9"
-        case 109: keyName = "F10"
-        case 103: keyName = "F11"
-        case 111: keyName = "F12"
-        default:  keyName = String(format: "#%d", code)
+        var keyName: String? = nil
+
+        if let currentLayout = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() {
+            let layoutDataRef = TISGetInputSourceProperty(currentLayout, kTISPropertyUnicodeKeyLayoutData)
+            if layoutDataRef != nil {
+                 let layoutData = Unmanaged<CFData>.fromOpaque(layoutDataRef!).takeUnretainedValue() as Data
+                 keyName = layoutData.withUnsafeBytes { layoutBytes -> String? in
+                     guard let keyboardLayout = layoutBytes.baseAddress?.assumingMemoryBound(to: UCKeyboardLayout.self) else {
+                         print("formatHotkey: Failed to bind keyboard layout memory.")
+                         return nil
+                     }
+                     var deadKeyState: UInt32 = 0
+                     let maxChars = 4
+                     var actualChars = 0
+                     var unicodeChars = [UniChar](repeating: 0, count: maxChars)
+                     var carbonModifiers: UInt32 = 0
+                     if mods.contains(.maskShift)     { carbonModifiers |= UInt32(shiftKey) }
+                     if mods.contains(.maskControl)   { carbonModifiers |= UInt32(controlKey) }
+                     if mods.contains(.maskAlternate) { carbonModifiers |= UInt32(optionKey) }
+                     if mods.contains(.maskCommand)   { carbonModifiers |= UInt32(cmdKey) }
+
+                     let status = UCKeyTranslate(keyboardLayout,
+                                                 UInt16(code),
+                                                 UInt16(kUCKeyActionDisplay),
+                                                 (carbonModifiers >> 8) & 0xFF,
+                                                 UInt32(LMGetKbdType()),
+                                                 UInt32(kUCKeyTranslateNoDeadKeysBit),
+                                                 &deadKeyState,
+                                                 maxChars,
+                                                 &actualChars,
+                                                 &unicodeChars)
+
+                     if status == noErr && actualChars > 0 {
+                         let char = String(utf16CodeUnits: unicodeChars, count: actualChars)
+                         switch Int(code) {
+                             case kVK_Space: return "Space"
+                             case kVK_Return: return "Return"
+                             case kVK_Tab: return "Tab"
+                             case kVK_Escape: return "Esc"
+                             case kVK_Delete: return "Delete"
+                             case kVK_ForwardDelete: return "Fwd Del"
+                             case kVK_LeftArrow: return "←"
+                             case kVK_RightArrow: return "→"
+                             case kVK_UpArrow: return "↑"
+                             case kVK_DownArrow: return "↓"
+                             case kVK_Home: return "Home"
+                             case kVK_End: return "End"
+                             case kVK_PageUp: return "PgUp"
+                             case kVK_PageDown: return "PgDn"
+                             case kVK_F1...kVK_F20: return "F\(Int(code) - kVK_F1 + 1)"
+                             default:
+                                 let trimmedChar = char.trimmingCharacters(in: .whitespacesAndNewlines)
+                                 if trimmedChar.isEmpty && !char.isEmpty { return nil }
+                                 return trimmedChar.isEmpty ? nil : trimmedChar.uppercased()
+                         }
+                     } else {
+                         return nil
+                     }
+                 }
+             }
         }
-        pieces.append(keyName)
+
+        if keyName == nil || keyName!.isEmpty {
+            switch Int(code) {
+                case kVK_Space: keyName = "Space"; case kVK_Escape: keyName = "Esc"; case kVK_Return: keyName = "Return"; case kVK_Delete: keyName = "Delete"; case kVK_ForwardDelete: keyName = "Fwd Del"; case kVK_Tab: keyName = "Tab"
+                case kVK_F1...kVK_F20: keyName = "F\(Int(code) - kVK_F1 + 1)"
+                case kVK_UpArrow: keyName = "↑"; case kVK_DownArrow: keyName = "↓"; case kVK_LeftArrow: keyName = "←"; case kVK_RightArrow: keyName = "→"
+                case kVK_Home: keyName = "Home"; case kVK_End: keyName = "End"; case kVK_PageUp: keyName = "PgUp"; case kVK_PageDown: keyName = "PgDn"
+                default: keyName = String(format: "Key #%d", code)
+            }
+        }
+
+        pieces.append(keyName ?? "<???>")
         return pieces.joined()
     }
 
-    // MARK: - NSAlert Help
+    // MARK: - NSAlert Help (Optional)
     func alertShowHelp(_ alert: NSAlert) -> Bool {
-        if alert.helpAnchor == "OllamaModel" {
-            let help = NSAlert()
-            help.messageText = "Ollama Models"
-            help.informativeText = """
-            New models can be downloaded from https://ollama.com/search
-            View models you have already downloaded by running “ollama list” in Terminal.
-            """
-            help.addButton(withTitle: "OK")
-            help.runModal()
-            return true
-        } else if alert.helpAnchor == "HotkeyConfig" {
-            let help = NSAlert()
-            help.messageText = "Configure Hotkey"
-            help.informativeText = """
-            WhisperType listens for a single key (plus optional modifiers) as its trigger.
-            Click ‘Set Hotkey…’, press your preferred combination (e.g. Fn or ⌥F),
-            and WhisperType will use it immediately and remember it next launch.
-            """
-            help.addButton(withTitle: "OK")
-            help.runModal()
-            return true
-        }
-        return false
+         print("Help requested for alert: \(alert.messageText)")
+         return false
     }
 
-} // End of AppDelegate class
+    // MARK: - NSTextFieldDelegate Methods
+    func controlTextDidChange(_ obj: Notification) {
+        // Optional: Add logic here if needed when text changes
+    }
+
+    // <<< REMOVED: No longer needed for NSPopUpButton >>>
+    // func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool { ... }
+
+
+} // **** Final closing brace for the AppDelegate class ****
+
+
+// MARK: - Convenience accessor (Optional)
+extension AppDelegate {
+    static var shared: AppDelegate {
+        guard let delegate = NSApp.delegate as? AppDelegate else {
+            fatalError("AppDelegate instance not found. Check @main attribute and application lifecycle.")
+        }
+        return delegate
+    }
+}

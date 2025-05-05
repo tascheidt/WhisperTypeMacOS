@@ -3,6 +3,6 @@
 <plist version="1.0">
 <dict>
 	<key>Privacy - Accessibility Usage Description</key>
-	<string>WhisperType needs access to monitor keyboard events to detect the hotkey ('fn' key) for starting and stopping voice input.</string>
+	<string>WhisperType needs access to monitor keyboard events to detect the hotkey for starting and stopping voice input.</string>
 </dict>
 </plist>
