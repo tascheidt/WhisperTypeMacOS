@@ -10,12 +10,14 @@
 		D26CEF4E2DC5255B00A73A9F /* ggml-base.en.bin in Resources */ = {isa = PBXBuildFile; fileRef = D26CEF4D2DC5255B00A73A9F /* ggml-base.en.bin */; };
 		D26CEF522DC54CD000A73A9F /* whisper-cli in Resources */ = {isa = PBXBuildFile; fileRef = D26CEF512DC54CD000A73A9F /* whisper-cli */; };
 		D2D97D3E2DC8365D00DC7B7E /* KeyboardShortcuts in Frameworks */ = {isa = PBXBuildFile; productRef = D2D97D3D2DC8365D00DC7B7E /* KeyboardShortcuts */; };
+		D2D97D482DC9406900DC7B7E /* README.md in Resources */ = {isa = PBXBuildFile; fileRef = D2D97D472DC9406900DC7B7E /* README.md */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		D26CEF4D2DC5255B00A73A9F /* ggml-base.en.bin */ = {isa = PBXFileReference; lastKnownFileType = archive.macbinary; path = "ggml-base.en.bin"; sourceTree = "<group>"; };
 		D26CEF512DC54CD000A73A9F /* whisper-cli */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.executable"; path = "whisper-cli"; sourceTree = "<group>"; };
 		D2A956E12DC3F51600E4E687 /* WhisperType.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WhisperType.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		D2D97D472DC9406900DC7B7E /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -63,6 +65,7 @@
 		D2A956D82DC3F51600E4E687 = {
 			isa = PBXGroup;
 			children = (
+				D2D97D472DC9406900DC7B7E /* README.md */,
 				D26CEF4C2DC5247300A73A9F /* Resources */,
 				D2A956E32DC3F51600E4E687 /* WhisperType */,
 				D2A956E22DC3F51600E4E687 /* Products */,
@@ -146,6 +149,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				D26CEF4E2DC5255B00A73A9F /* ggml-base.en.bin in Resources */,
+				D2D97D482DC9406900DC7B7E /* README.md in Resources */,
 				D26CEF522DC54CD000A73A9F /* whisper-cli in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
