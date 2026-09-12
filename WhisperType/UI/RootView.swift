@@ -80,7 +80,6 @@ private struct OnboardingView: View {
     @ObservedObject var store: AppDataStore
     @ObservedObject var permissions: PermissionService
     @State private var page = 0
-    private let timer = Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()
 
     var body: some View {
         ZStack {
@@ -123,8 +122,9 @@ private struct OnboardingView: View {
             }
             .padding(42)
         }
-        .onReceive(timer) { _ in
-            if page == 1 { controller.refreshPermissions(prompt: false) }
+        .onAppear { controller.refreshPermissions(prompt: false) }
+        .onChange(of: page) { _, newPage in
+            if newPage == 1 { controller.refreshPermissions(prompt: false) }
         }
     }
 
@@ -152,24 +152,76 @@ private struct OnboardingView: View {
     }
 
     private var permissionsCard: some View {
-        VStack(spacing: 0) {
-            PermissionSetupRow(
-                symbol: "mic.fill", title: "Microphone", detail: "Records only while dictation is active",
-                granted: permissions.microphoneGranted,
-                actionTitle: permissions.microphoneGranted ? "Granted" : "Allow"
-            ) { Task { await controller.requestMicrophone() } }
-            Divider().padding(.leading, 52)
-            PermissionSetupRow(
-                symbol: "accessibility", title: "Accessibility", detail: "Listens for your shortcut and inserts text",
-                granted: permissions.accessibilityGranted,
-                actionTitle: permissions.accessibilityGranted ? "Granted" : "Allow"
-            ) {
-                controller.refreshPermissions(prompt: true)
-                if !permissions.accessibilityGranted { permissions.openAccessibilitySettings() }
+        VStack(spacing: 12) {
+            VStack(spacing: 0) {
+                PermissionSetupRow(
+                    symbol: "mic.fill", title: "Microphone", detail: microphoneDetail,
+                    granted: permissions.microphoneGranted,
+                    actionTitle: microphoneActionTitle,
+                    isWorking: permissions.isRequestingMicrophone,
+                    actionDisabled: permissions.microphoneState == .restricted
+                ) { Task { await controller.requestMicrophone() } }
+                Divider().padding(.leading, 52)
+                PermissionSetupRow(
+                    symbol: "accessibility", title: "Accessibility", detail: accessibilityDetail,
+                    granted: permissions.accessibilityGranted,
+                    actionTitle: permissions.accessibilityGranted ? "Granted" : permissions.accessibilitySetupStarted ? "Open Settings" : "Allow",
+                    isWorking: false,
+                    actionDisabled: false
+                ) { controller.requestAccessibility() }
+            }
+            .padding(.horizontal, 18)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
+
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                Text("Permission status updates automatically when you return.")
+                Spacer()
+                Button("Check Again") { controller.refreshPermissions(prompt: false) }
+                    .buttonStyle(.borderless)
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            if permissions.accessibilitySetupStarted && !permissions.accessibilityGranted {
+                Label("If WhisperType already appears enabled, turn it off and on once so macOS refreshes the installed app’s permission.", systemImage: "info.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            if permissions.isRequestingMicrophone {
+                Label("Complete the macOS microphone dialog to continue.", systemImage: "macwindow.badge.plus")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .padding(.horizontal, 18)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    private var microphoneActionTitle: String {
+        if permissions.isRequestingMicrophone { return "Waiting…" }
+        switch permissions.microphoneState {
+        case .notRequested: return "Allow"
+        case .granted: return "Granted"
+        case .denied: return "Open Settings"
+        case .restricted: return "Unavailable"
+        }
+    }
+
+    private var microphoneDetail: String {
+        switch permissions.microphoneState {
+        case .notRequested: "Records only while dictation is active"
+        case .granted: "Ready for private, on-device dictation"
+        case .denied: "Access is off — enable it in Privacy & Security"
+        case .restricted: "Blocked by a system or device policy"
+        }
+    }
+
+    private var accessibilityDetail: String {
+        if permissions.accessibilityGranted { return "Ready to listen for your shortcut and insert text" }
+        if permissions.accessibilitySetupStarted { return "Enable WhisperType in System Settings, then return here" }
+        return "Listens for your shortcut and inserts text"
     }
 
     private var shortcutCard: some View {
@@ -209,6 +261,8 @@ private struct PermissionSetupRow: View {
     let symbol: String, title: String, detail: String
     let granted: Bool
     let actionTitle: String
+    let isWorking: Bool
+    let actionDisabled: Bool
     let action: () -> Void
     var body: some View {
         HStack(spacing: 14) {
@@ -221,7 +275,12 @@ private struct PermissionSetupRow: View {
             if granted {
                 Button(actionTitle, action: action).buttonStyle(.borderless).disabled(true)
             } else {
-                Button(actionTitle, action: action).buttonStyle(.borderedProminent)
+                HStack(spacing: 8) {
+                    if isWorking { ProgressView().controlSize(.small) }
+                    Button(actionTitle, action: action)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(isWorking || actionDisabled)
+                }
             }
             Image(systemName: granted ? "checkmark.circle.fill" : "circle")
                 .foregroundStyle(granted ? .green : .secondary)
@@ -582,11 +641,11 @@ private struct SettingsView: View {
     var body: some View {
         Form {
             Section("Permissions") {
-                permissionRow("Microphone", granted: permissions.microphoneGranted) {
+                permissionRow("Microphone", granted: permissions.microphoneGranted, actionTitle: permissions.microphoneState == .notRequested ? "Allow" : "Open Settings") {
                     Task { await controller.requestMicrophone() }
                 }
-                permissionRow("Accessibility", granted: permissions.accessibilityGranted) {
-                    controller.refreshPermissions(prompt: true); permissions.openAccessibilitySettings()
+                permissionRow("Accessibility", granted: permissions.accessibilityGranted, actionTitle: "Open Settings") {
+                    controller.requestAccessibility()
                 }
                 Button("Refresh permission status") { controller.refreshPermissions(prompt: false) }
             }
@@ -664,13 +723,13 @@ private struct SettingsView: View {
     }
 
     @ViewBuilder
-    private func permissionRow(_ title: String, granted: Bool, action: @escaping () -> Void) -> some View {
+    private func permissionRow(_ title: String, granted: Bool, actionTitle: String, action: @escaping () -> Void) -> some View {
         HStack {
             Label(title, systemImage: granted ? "checkmark.circle.fill" : "exclamationmark.circle")
                 .foregroundStyle(granted ? .green : .orange)
             Spacer()
             Text(granted ? "Granted" : "Required").foregroundStyle(.secondary)
-            if !granted { Button("Open Settings", action: action) }
+            if !granted { Button(actionTitle, action: action) }
         }
     }
 }

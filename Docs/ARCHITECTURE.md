@@ -13,6 +13,14 @@ WhisperType is a local-first macOS menu-bar application. Version 2 replaces the 
 7. `TextInsertionService` first uses the selected-text Accessibility attribute. If the target does not support it, the service pastes while preserving and restoring the existing clipboard.
 8. `AppDataStore` persists settings, statistics, history, dictionary, snippets, and scratchpad data.
 
+## Installation and permissions
+
+`InstallationService` detects read-only disk images and App Translocation before the application controller starts. A mounted copy presents a native move-to-Applications prompt and never requests privacy permissions. Release builds use a stable designated requirement when a Developer ID is unavailable, preventing a rebuilt binary from appearing enabled in System Settings while failing the runtime trust check.
+
+Debug builds use a separate bundle identifier so Xcode runs cannot overwrite or pollute the installed release app’s TCC records.
+
+`PermissionService` models first-time, granted, denied, and restricted microphone states. It requests access only from the first-time state, opens the correct Privacy & Security pane after a denial, polls permission state while the app is running, and refreshes immediately whenever the app becomes active. Accessibility changes therefore propagate to SwiftUI and the global hotkey manager without a restart.
+
 ## Process safety
 
 The speech server binds only to loopback on a randomized high port. `engine-watchdog.sh` monitors the app process and terminates the speech server if the app exits unexpectedly. Both speech executables are statically linked except for Apple system frameworks.
@@ -29,7 +37,7 @@ The speech server binds only to loopback on a randomized high port. `engine-watc
 
 - `WhisperType/App`: lifecycle coordination and state machine
 - `WhisperType/Core`: persistent models and preferences
-- `WhisperType/Services`: permissions, hotkeys, audio, transcription, refinement, context, and insertion
+- `WhisperType/Services`: installation, permissions, hotkeys, audio, transcription, refinement, context, and insertion
 - `WhisperType/UI`: onboarding, hub, settings, and dictation overlay
 - `Tests`: deterministic text-pipeline tests
 - `Scripts`: build, verify, DMG, and local installation workflows

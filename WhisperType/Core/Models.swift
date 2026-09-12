@@ -3,6 +3,46 @@ import Carbon.HIToolbox
 import CoreGraphics
 import Foundation
 
+enum PermissionGrantState: String, Equatable, Sendable {
+    case notRequested
+    case granted
+    case denied
+    case restricted
+
+    var isGranted: Bool { self == .granted }
+
+    var action: PermissionAction {
+        switch self {
+        case .notRequested: .request
+        case .denied: .openSettings
+        case .restricted, .granted: .none
+        }
+    }
+}
+
+enum PermissionAction: Equatable, Sendable {
+    case request
+    case openSettings
+    case none
+}
+
+enum InstallationLocationPolicy {
+    static func requiresInstallation(bundlePath: String, volumeIsReadOnly: Bool) -> Bool {
+        let path = (bundlePath as NSString).standardizingPath
+        let components = path.split(separator: "/")
+        let isSystemApplicationsCopy = path.hasPrefix("/Applications/")
+            || path.hasPrefix("/System/Applications/")
+        let isUserApplicationsCopy = components.count >= 4
+            && components[0] == "Users"
+            && components[2] == "Applications"
+
+        if volumeIsReadOnly || path.hasPrefix("/Volumes/") || path.contains("/AppTranslocation/") {
+            return true
+        }
+        return !isSystemApplicationsCopy && !isUserApplicationsCopy
+    }
+}
+
 enum DictationMode: String, Codable, Sendable {
     case dictation
     case command

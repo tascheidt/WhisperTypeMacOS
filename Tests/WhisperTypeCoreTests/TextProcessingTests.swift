@@ -3,6 +3,36 @@ import XCTest
 @testable import WhisperTypeCore
 
 final class TextProcessingTests: XCTestCase {
+    func testPermissionStatesChooseTheCorrectRecoveryAction() {
+        XCTAssertEqual(PermissionGrantState.notRequested.action, .request)
+        XCTAssertEqual(PermissionGrantState.denied.action, .openSettings)
+        XCTAssertEqual(PermissionGrantState.restricted.action, .none)
+        XCTAssertEqual(PermissionGrantState.granted.action, .none)
+    }
+
+    func testDiskImageRequiresInstallationButApplicationsCopyDoesNot() {
+        XCTAssertTrue(InstallationLocationPolicy.requiresInstallation(
+            bundlePath: "/Volumes/WhisperType Installer/WhisperType.app",
+            volumeIsReadOnly: true
+        ))
+        XCTAssertTrue(InstallationLocationPolicy.requiresInstallation(
+            bundlePath: "/private/var/folders/AppTranslocation/WhisperType.app",
+            volumeIsReadOnly: false
+        ))
+        XCTAssertTrue(InstallationLocationPolicy.requiresInstallation(
+            bundlePath: "/Users/test/Downloads/WhisperType.app",
+            volumeIsReadOnly: false
+        ))
+        XCTAssertFalse(InstallationLocationPolicy.requiresInstallation(
+            bundlePath: "/Applications/WhisperType.app",
+            volumeIsReadOnly: false
+        ))
+        XCTAssertFalse(InstallationLocationPolicy.requiresInstallation(
+            bundlePath: "/Users/test/Applications/WhisperType.app",
+            volumeIsReadOnly: false
+        ))
+    }
+
     private let emptyContext = TextContext.empty
 
     func testDefaultShortcutIsFunctionKey() {

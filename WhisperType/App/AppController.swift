@@ -46,6 +46,7 @@ final class AppController: ObservableObject {
     private var processingTask: Task<Void, Never>?
     private var captureCommandShortcut = false
     private var settingsCancellable: AnyCancellable?
+    private var accessibilityCancellable: AnyCancellable?
 
     init(store: AppDataStore? = nil, permissions: PermissionService? = nil) {
         self.store = store ?? AppDataStore()
@@ -53,6 +54,8 @@ final class AppController: ObservableObject {
     }
 
     func start() {
+        NSApp.setActivationPolicy(.regular)
+        permissions.startMonitoring()
         setupStatusItem()
         recorder.onLevel = { [weak self] level in self?.updateLevel(level) }
         recorder.onMaximumDuration = { [weak self] in self?.finishRecording() }
@@ -61,6 +64,9 @@ final class AppController: ObservableObject {
         settingsCancellable = store.$settings
             .removeDuplicates()
             .sink { [weak self] settings in self?.apply(settings) }
+        accessibilityCancellable = permissions.$accessibilityGranted
+            .removeDuplicates()
+            .sink { [weak self] granted in self?.setAccessibilityEnabled(granted) }
         apply(store.settings)
         refreshPermissions(prompt: false)
         Task { await transcriber.prewarm(modelFileName: store.settings.modelFileName) }
@@ -72,11 +78,13 @@ final class AppController: ObservableObject {
         processingTask?.cancel()
         recorder.cancel()
         hotkeys.stop()
+        permissions.stopMonitoring()
         Task { await transcriber.shutdown() }
         statusItem = nil
     }
 
     func showHub(section: AppSection? = nil) {
+        permissions.refresh()
         if NSWorkspace.shared.frontmostApplication?.bundleIdentifier != Bundle.main.bundleIdentifier {
             lastExternalTarget = ContextService.capture(includeText: false)
         }
@@ -100,11 +108,16 @@ final class AppController: ObservableObject {
     func refreshPermissions(prompt: Bool) {
         permissions.refresh()
         if !permissions.accessibilityGranted, prompt { permissions.requestAccessibility() }
-        if permissions.accessibilityGranted { _ = hotkeys.start() }
-        else { hotkeys.stop() }
+        setAccessibilityEnabled(permissions.accessibilityGranted)
     }
 
     func requestMicrophone() async { _ = await permissions.requestMicrophone() }
+
+    func requestAccessibility() { permissions.requestAccessibility() }
+
+    func applicationDidBecomeActive() {
+        refreshPermissions(prompt: false)
+    }
 
     func completeOnboarding() {
         permissions.refresh()
@@ -411,6 +424,11 @@ final class AppController: ObservableObject {
             status.message = "Hold \(settings.shortcut.displayName) to dictate"
             updateStatusItem()
         }
+    }
+
+    private func setAccessibilityEnabled(_ enabled: Bool) {
+        if enabled { _ = hotkeys.start() }
+        else { hotkeys.stop() }
     }
 
     private func setupStatusItem() {

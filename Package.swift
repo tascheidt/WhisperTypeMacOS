@@ -14,6 +14,7 @@ let package = Package(
                 "main.swift", "Core/AppDataStore.swift", "Services/AIRefinementService.swift",
                 "Services/AudioRecordingService.swift", "Services/ContextAndInsertionService.swift",
                 "Services/HotkeyManager.swift", "Services/LaunchAtLoginService.swift",
+                "Services/InstallationService.swift",
                 "Services/PermissionService.swift", "Services/SecureStore.swift", "Services/TranscriptionService.swift"
             ],
             sources: ["Core/Models.swift", "Services/TextProcessingService.swift"]

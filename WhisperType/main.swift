@@ -3,5 +3,5 @@ import AppKit
 let application = NSApplication.shared
 let appDelegate = MainActor.assumeIsolated { AppDelegate() }
 application.delegate = appDelegate
-application.setActivationPolicy(.accessory)
+application.setActivationPolicy(.regular)
 _ = NSApplicationMain(CommandLine.argc, CommandLine.unsafeArgv)

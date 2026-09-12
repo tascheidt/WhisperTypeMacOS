@@ -1,4 +1,4 @@
-# WhisperType 2
+# WhisperType 2.0.1
 
 WhisperType is a local-first macOS dictation app that turns natural speech into polished text in any application. Hold **Fn**, speak, and release to insert. Double-tap Fn for hands-free mode.
 
@@ -35,11 +35,10 @@ The app ships with its speech engine and model. Ollama, Homebrew, Python, and an
 From the repository root:
 
 ```sh
-./Scripts/build-release.sh
 ./Scripts/install.sh
 ```
 
-The app is installed at `/Applications/WhisperType.app` and opened. The first launch walks through the two required permissions. If an older `/Applications/WhisperType.app` exists, the installer moves it to a timestamped backup beside the new app.
+The script builds a fresh release, installs it at `/Applications/WhisperType.app`, and opens it. The first launch walks through the two required permissions. If an older copy exists, the installer keeps a temporary rollback copy until the new app passes signature verification, then removes it.
 
 To create a drag-to-Applications disk image:
 
@@ -47,9 +46,9 @@ To create a drag-to-Applications disk image:
 ./Scripts/create-dmg.sh
 ```
 
-The result is `Dist/WhisperType-2.0.0.dmg`.
+The result is `Dist/WhisperType-<version>.dmg`. Open it and drag WhisperType onto the Applications folder. If the app is accidentally opened from the disk image, it offers to move itself to Applications before requesting permissions; onboarding never binds permissions to the mounted copy.
 
-The release is ad-hoc signed for local installation. Distributing it to other Macs without a Gatekeeper warning requires an Apple Developer ID certificate and notarization.
+The build script automatically uses a Developer ID or Apple Development identity when one is installed. Otherwise it applies a stable local designated requirement so Microphone and Accessibility grants survive rebuilds on the development Mac. Distributing to other Macs without a Gatekeeper warning still requires a Developer ID certificate and notarization.
 
 ## Use
 
@@ -87,8 +86,8 @@ Architecture and model provenance are documented in [Docs/ARCHITECTURE.md](Docs/
 
 ## Troubleshooting
 
-- **Fn does nothing:** Open Settings → Privacy & Security → Accessibility, enable WhisperType, then reopen the app.
-- **No recording:** Enable WhisperType under Privacy & Security → Microphone.
+- **Fn does nothing:** Open Settings → Privacy & Security → Accessibility and enable WhisperType. The onboarding screen refreshes automatically when you return. If an older build is already enabled but the app still says access is required, turn the entry off and on once.
+- **No recording:** On first use, click Allow and accept the native macOS prompt. If access was denied earlier, the button changes to Open Settings and takes you directly to Privacy & Security → Microphone.
 - **The first dictation is slow:** The large speech model warms in the background at launch. Later dictations reuse it and are substantially faster.
 - **Text is copied but not inserted:** The target app blocked simulated paste. Paste manually with Command-V and verify Accessibility permission.
 - **OpenRouter fails:** Confirm the key and model slug in Settings, or switch the provider back to Automatic.
