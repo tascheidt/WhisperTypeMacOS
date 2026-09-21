@@ -82,6 +82,9 @@ enum ContextService {
 
 @MainActor
 final class TextInsertionService {
+    private var pendingRestoreTask: Task<Void, Never>?
+    private var baseSnapshot: PasteboardSnapshot?
+
     func insert(_ text: String, into target: CapturedTarget) async -> Bool {
         guard !text.isEmpty else { return true }
         if let element = target.element,
@@ -92,6 +95,9 @@ final class TextInsertionService {
     }
 
     func copy(_ text: String) {
+        pendingRestoreTask?.cancel()
+        pendingRestoreTask = nil
+        baseSnapshot = nil
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
@@ -108,18 +114,35 @@ final class TextInsertionService {
     }
 
     private func paste(_ text: String, into application: NSRunningApplication?) async -> Bool {
+        pendingRestoreTask?.cancel()
+        pendingRestoreTask = nil
+
         let pasteboard = NSPasteboard.general
-        let snapshot = PasteboardSnapshot(pasteboard: pasteboard)
+        if baseSnapshot == nil {
+            baseSnapshot = PasteboardSnapshot(pasteboard: pasteboard)
+        }
+
         pasteboard.clearContents()
-        guard pasteboard.setString(text, forType: .string) else { return false }
+        guard pasteboard.setString(text, forType: .string) else {
+            baseSnapshot = nil
+            return false
+        }
         let insertedChangeCount = pasteboard.changeCount
 
         if let application, !application.isTerminated { application.activate() }
         try? await Task.sleep(for: .milliseconds(90))
         postCommandKey(CGKeyCode(kVK_ANSI_V))
-        try? await Task.sleep(for: .milliseconds(550))
 
-        if pasteboard.changeCount == insertedChangeCount { snapshot.restore(to: pasteboard) }
+        pendingRestoreTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled else { return }
+            guard let self else { return }
+            if pasteboard.changeCount == insertedChangeCount, let snapshot = self.baseSnapshot {
+                snapshot.restore(to: pasteboard)
+            }
+            self.baseSnapshot = nil
+            self.pendingRestoreTask = nil
+        }
         return true
     }
 }

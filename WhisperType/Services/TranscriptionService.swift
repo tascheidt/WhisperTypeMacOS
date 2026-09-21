@@ -43,6 +43,7 @@ actor TranscriptionService {
         guard let modelURL = Bundle.main.url(forResource: configuration.modelFileName, withExtension: nil) else {
             throw WhisperTypeError.missingResource(configuration.modelFileName)
         }
+        try Self.validateModelFile(at: modelURL)
 
         let outputBase = FileManager.default.temporaryDirectory
             .appendingPathComponent("whispertype-output-\(UUID().uuidString)")
@@ -57,7 +58,8 @@ actor TranscriptionService {
             "--output-txt",
             "--output-file", outputBase.path,
             "--no-timestamps",
-            "--no-prints"
+            "--no-prints",
+            "--max-context", "0"
         ]
         if configuration.translateToEnglish { arguments.append("--translate") }
         if !configuration.vocabularyPrompt.isEmpty {
@@ -97,7 +99,12 @@ actor TranscriptionService {
         if Bundle.main.url(forResource: "engine-watchdog", withExtension: "sh") == nil {
             problems.append("Missing engine-watchdog.sh")
         }
-        if Bundle.main.url(forResource: modelFileName, withExtension: nil) == nil {
+        if let modelURL = Bundle.main.url(forResource: modelFileName, withExtension: nil) {
+            let values = try? modelURL.resourceValues(forKeys: [.fileSizeKey])
+            if (values?.fileSize ?? 0) < 1_000_000 {
+                problems.append("Speech model \(modelFileName) is a Git LFS pointer or incomplete (< 1 MB)")
+            }
+        } else {
             problems.append("Missing \(modelFileName)")
         }
         return problems
@@ -121,6 +128,7 @@ actor TranscriptionService {
         guard let modelURL = Bundle.main.url(forResource: modelFileName, withExtension: nil) else {
             throw WhisperTypeError.missingResource(modelFileName)
         }
+        try Self.validateModelFile(at: modelURL)
 
         let port = Int.random(in: 52_000...61_000)
         let process = Process()
@@ -132,7 +140,8 @@ actor TranscriptionService {
             "--threads", String(max(4, min(10, ProcessInfo.processInfo.activeProcessorCount - 2))),
             "--language", "auto",
             "--flash-attn",
-            "--no-timestamps"
+            "--no-timestamps",
+            "--max-context", "0"
         ]
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
@@ -179,6 +188,7 @@ actor TranscriptionService {
         appendField("temperature", "0.0")
         appendField("temperature_inc", "0.2")
         appendField("response_format", "json")
+        appendField("max_context", "0")
         appendField("prompt", String(configuration.vocabularyPrompt.prefix(1_200)))
         body.appendUTF8("--\(boundary)\r\n")
         body.appendUTF8("Content-Disposition: form-data; name=\"file\"; filename=\"recording.wav\"\r\n")
@@ -226,6 +236,21 @@ actor TranscriptionService {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         value = value.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
         return value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func validateModelFile(at url: URL) throws {
+        let values = try? url.resourceValues(forKeys: [.fileSizeKey])
+        let fileSize = values?.fileSize ?? 0
+        if fileSize < 1_000_000 {
+            if let content = try? String(contentsOf: url, encoding: .utf8), content.contains("git-lfs") {
+                throw WhisperTypeError.transcriptionFailed(
+                    "Speech model '\(url.lastPathComponent)' is a Git LFS pointer file (~134 bytes), not the real model weights (~574 MB). Run 'git lfs pull' or './Scripts/fetch-model.sh' and rebuild the app."
+                )
+            }
+            throw WhisperTypeError.transcriptionFailed(
+                "Speech model '\(url.lastPathComponent)' is incomplete or corrupted (\(fileSize) bytes). Run './Scripts/fetch-model.sh' and rebuild the app."
+            )
+        }
     }
 }
 

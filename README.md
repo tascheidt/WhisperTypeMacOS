@@ -29,6 +29,7 @@ The app ships with its speech engine and model. Ollama, Homebrew, Python, and an
 - macOS 14 Sonoma or later
 - Approximately 600 MB of disk space for the installed app
 - Microphone and Accessibility permissions
+- Git LFS (optional, but recommended for cloning; build scripts will automatically download the model via `curl` if `git-lfs` is not installed)
 
 ## Install on this Mac
 
@@ -91,6 +92,7 @@ Architecture and model provenance are documented in [Docs/ARCHITECTURE.md](Docs/
 - **The first dictation is slow:** The large speech model warms in the background at launch. Later dictations reuse it and are substantially faster.
 - **Text is copied but not inserted:** The target app blocked simulated paste. Paste manually with Command-V and verify Accessibility permission.
 - **OpenRouter fails:** Confirm the key and model slug in Settings, or switch the provider back to Automatic.
+- **"failed to initialize whisper context":** The speech model file is an un-downloaded Git LFS pointer (~134 bytes). Run `./Scripts/fetch-model.sh` (or `git lfs pull`), then rebuild and reinstall with `./Scripts/install.sh`.
 
 ## License
 

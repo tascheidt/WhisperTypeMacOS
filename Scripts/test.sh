@@ -4,6 +4,8 @@ set -eu
 project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$project_root"
 
+"$project_root/Scripts/fetch-model.sh"
+
 swift test
 xcodebuild \
     -project WhisperType.xcodeproj \

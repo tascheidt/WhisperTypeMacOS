@@ -26,6 +26,8 @@ esac
 
 mkdir -p "$dist_dir"
 
+"$project_root/Scripts/fetch-model.sh"
+
 xcodebuild \
     -project "$project_root/WhisperType.xcodeproj" \
     -scheme WhisperType \
