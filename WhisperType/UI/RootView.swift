@@ -115,7 +115,10 @@ private struct OnboardingView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
-                    .disabled(page == 1 && (!permissions.microphoneGranted || !permissions.accessibilityGranted))
+                    .disabled(
+                        (page == 1 && (!permissions.microphoneGranted || !permissions.accessibilityGranted))
+                            || (page == 2 && controller.speechEngineHealth == .checking)
+                    )
                 }
                 .frame(maxWidth: 590)
                 Spacer()
@@ -140,15 +143,36 @@ private struct OnboardingView: View {
     }
 
     private var welcomeCard: some View {
-        HStack(spacing: 0) {
-            FeatureIntro(symbol: "lock.shield.fill", title: "Local first", detail: "Speech transcription runs on your Mac")
-            Divider().frame(height: 70)
-            FeatureIntro(symbol: "sparkles", title: "Polished", detail: "Filler, formatting, and corrections handled")
-            Divider().frame(height: 70)
-            FeatureIntro(symbol: "app.badge.checkmark", title: "Every app", detail: "Messages, browsers, editors, and more")
+        VStack(spacing: 0) {
+            HStack(spacing: 0) {
+                FeatureIntro(symbol: "lock.shield.fill", title: "Local first", detail: "Speech transcription runs on your Mac")
+                Divider().frame(height: 70)
+                FeatureIntro(symbol: "sparkles", title: "Polished", detail: "Filler, formatting, and corrections handled")
+                Divider().frame(height: 70)
+                FeatureIntro(symbol: "app.badge.checkmark", title: "Every app", detail: "Messages, browsers, editors, and more")
+            }
+            .padding(20)
+            Divider()
+            HStack(spacing: 9) {
+                if controller.speechEngineHealth == .checking {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: speechEngineReady ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                        .foregroundStyle(speechEngineReady ? .green : .orange)
+                }
+                Text("Speech engine")
+                Spacer()
+                Text(controller.speechEngineHealth.title).foregroundStyle(.secondary)
+            }
+            .font(.caption)
+            .padding(.horizontal, 18).padding(.vertical, 11)
         }
-        .padding(20)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    private var speechEngineReady: Bool {
+        if case .ready = controller.speechEngineHealth { return true }
+        return false
     }
 
     private var permissionsCard: some View {
@@ -667,7 +691,8 @@ private struct SettingsView: View {
                 Toggle("Smart formatting", isOn: $store.settings.autoFormatting)
                 Toggle("Remove filler words", isOn: $store.settings.removeFillers)
                 Toggle("Use nearby text and app context", isOn: $store.settings.contextAwareness)
-                LabeledContent("Speech model", value: "Whisper large-v3-turbo • Q5 • Metal")
+                LabeledContent("Speech model", value: "Whisper large-v3-turbo • Q5 • Local")
+                speechEngineRow
             }
 
             Section("AI refinement") {
@@ -720,6 +745,39 @@ private struct SettingsView: View {
         case .appleIntelligence: "Uses Apple’s on-device model. Requires Apple Intelligence to be enabled and available on this Mac."
         case .openRouter: "Uses your chosen model for the most capable rewriting. Your key is stored in the macOS Keychain."
         }
+    }
+
+    private var speechEngineRow: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label {
+                    Text("Speech engine")
+                } icon: {
+                    if controller.speechEngineHealth == .checking {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: speechEngineIsReady ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                            .foregroundStyle(speechEngineIsReady ? .green : .orange)
+                    }
+                }
+                Spacer()
+                Text(controller.speechEngineHealth.title).foregroundStyle(.secondary)
+            }
+            if case .failed(let detail) = controller.speechEngineHealth {
+                Text(detail).font(.caption).foregroundStyle(.secondary)
+            }
+            HStack {
+                Button("Run check") { controller.checkSpeechEngine() }
+                    .disabled(controller.speechEngineHealth == .checking)
+                Button("Show diagnostics…") { controller.openSpeechEngineDiagnostics() }
+            }
+            .buttonStyle(.borderless)
+        }
+    }
+
+    private var speechEngineIsReady: Bool {
+        if case .ready = controller.speechEngineHealth { return true }
+        return false
     }
 
     @ViewBuilder

@@ -7,7 +7,7 @@ WhisperType is a local-first macOS menu-bar application. Version 2 replaces the 
 1. `HotkeyManager` observes the global shortcut (Fn by default) through a Core Graphics event tap.
 2. `ContextService` captures the target application and a bounded amount of nearby, non-secure text.
 3. `AudioRecordingService` records a 16 kHz mono WAV and publishes meter levels to the non-activating overlay.
-4. `TranscriptionService` sends the WAV to a private `127.0.0.1` whisper.cpp process. The quantized large-v3-turbo model remains warm between dictations. The CLI is a fallback if the warm service cannot start.
+4. `TranscriptionService` verifies the bundled model’s exact byte count and SHA-256 before loading it, then sends the WAV to a private `127.0.0.1` whisper.cpp process. The quantized large-v3-turbo model remains warm between dictations. Engine startup progresses through Metal with flash attention, Metal compatibility mode, and CPU compatibility mode. The self-contained CLI repeats the same fallback sequence if the warm service cannot be used.
 5. `TextProcessingService` applies spoken formatting, backtracking, filler cleanup, personal dictionary corrections, snippets, and cursor-aware spacing.
 6. `AIRefinementService` optionally refines the text with Apple Intelligence or OpenRouter. Automatic mode never requires a network account and falls back to local rules.
 7. `TextInsertionService` first uses the selected-text Accessibility attribute. If the target does not support it, the service pastes while preserving and restoring the existing clipboard.
@@ -24,6 +24,12 @@ Debug builds use a separate bundle identifier so Xcode runs cannot overwrite or 
 ## Process safety
 
 The speech server binds only to loopback on a randomized high port. `engine-watchdog.sh` monitors the app process and terminates the speech server if the app exits unexpectedly. Both speech executables are statically linked except for Apple system frameworks.
+
+Speech-engine output is written to `~/Library/Logs/WhisperType/engine.log`, capped to a small rolling tail, and can be revealed from Settings. Logs contain engine diagnostics, not microphone audio or transcript text.
+
+## Release integrity
+
+`Scripts/model-metadata.sh` is the shared release manifest for the model filename, byte count, SHA-256, and pinned download URL. `fetch-model.sh` accepts only the manifested model and can retrieve it with Git LFS or a checksum-verified direct download. `build-release.sh` runs that preparation before invoking Xcode. `verify.sh` checks the signed application and proves that the bundled CLI can initialize the model in CPU compatibility mode. `create-dmg.sh` mounts the final compressed image and repeats the complete verification against the app users will install. `install.sh` verifies both its source and the installed copy, preserving the previous application if validation fails.
 
 ## Privacy boundaries
 

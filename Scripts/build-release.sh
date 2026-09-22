@@ -24,6 +24,8 @@ case "$signing_identity" in
     "Developer ID Application"*) timestamp_option="--timestamp" ;;
 esac
 
+"$project_root/Scripts/fetch-model.sh"
+
 mkdir -p "$dist_dir"
 
 xcodebuild \
@@ -61,5 +63,6 @@ else
         "$output_app"
 fi
 codesign --verify --deep --strict --verbose=2 "$output_app"
+"$project_root/Scripts/verify.sh" "$output_app"
 
 echo "Built $output_app using signing identity: $signing_identity"

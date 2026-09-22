@@ -43,6 +43,75 @@ enum InstallationLocationPolicy {
     }
 }
 
+enum SpeechModelManifest {
+    static let fileName = "ggml-large-v3-turbo-q5_0.bin"
+    static let expectedByteCount: Int64 = 574_041_195
+    static let expectedSHA256 = "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2"
+
+    static func integrityProblem(fileName: String, byteCount: Int64, sha256: String) -> String? {
+        guard fileName == Self.fileName else {
+            return "Unsupported speech model: \(fileName)."
+        }
+        guard byteCount == expectedByteCount else {
+            if byteCount < 1_024 {
+                return "The bundled speech model is only \(byteCount) bytes and appears to be an incomplete Git LFS download."
+            }
+            return "The bundled speech model has an unexpected size (\(byteCount) bytes)."
+        }
+        guard sha256.lowercased() == expectedSHA256 else {
+            return "The bundled speech model failed its integrity check."
+        }
+        return nil
+    }
+}
+
+enum SpeechEngineMode: String, Equatable, Sendable {
+    case metal
+    case metalCompatibility
+    case cpuCompatibility
+
+    var title: String {
+        switch self {
+        case .metal: "Metal"
+        case .metalCompatibility: "Metal compatibility"
+        case .cpuCompatibility: "CPU compatibility"
+        }
+    }
+
+    var isDegraded: Bool { self != .metal }
+}
+
+enum SpeechEngineHealth: Equatable, Sendable {
+    case checking
+    case ready(SpeechEngineMode)
+    case failed(String)
+
+    var title: String {
+        switch self {
+        case .checking: "Checking…"
+        case .ready(let mode): "Ready • \(mode.title)"
+        case .failed: "Needs attention"
+        }
+    }
+}
+
+enum SpeechEngineFallbackPolicy {
+    static func isInitializationFailure(_ diagnostic: String) -> Bool {
+        diagnostic.localizedCaseInsensitiveContains("failed to initialize whisper context")
+            || diagnostic.localizedCaseInsensitiveContains("failed to load model")
+            || diagnostic.localizedCaseInsensitiveContains("ggml_metal_init() failed")
+    }
+
+    static func shouldTryNext(
+        after mode: SpeechEngineMode,
+        terminationStatus: Int32,
+        diagnostic: String
+    ) -> Bool {
+        guard mode != .cpuCompatibility else { return false }
+        return terminationStatus != 0 || isInitializationFailure(diagnostic)
+    }
+}
+
 enum DictationMode: String, Codable, Sendable {
     case dictation
     case command
@@ -211,7 +280,7 @@ struct AppSettings: Codable, Equatable, Sendable {
     var keepAudioForRetry = false
     var doubleTapHandsFree = true
     var maximumRecordingSeconds = 360.0
-    var modelFileName = "ggml-large-v3-turbo-q5_0.bin"
+    var modelFileName = SpeechModelManifest.fileName
 }
 
 struct VocabularyEntry: Codable, Identifiable, Equatable, Hashable, Sendable {
@@ -280,6 +349,8 @@ enum WhisperTypeError: LocalizedError {
     case recordingFailed(String)
     case recordingTooShort
     case missingResource(String)
+    case invalidSpeechModel(String)
+    case speechEngineUnavailable(String)
     case transcriptionFailed(String)
     case emptyTranscript
     case insertionFailed
@@ -295,6 +366,8 @@ enum WhisperTypeError: LocalizedError {
         case .recordingFailed(let detail): "Could not record audio: \(detail)"
         case .recordingTooShort: "That recording was too short. Hold the shortcut a little longer."
         case .missingResource(let name): "The bundled transcription resource is missing: \(name)."
+        case .invalidSpeechModel(let detail): "WhisperType’s speech model is incomplete or damaged. Reinstall WhisperType from a verified installer. \(detail)"
+        case .speechEngineUnavailable(let detail): "WhisperType could not start its local speech engine, even in compatibility mode. \(detail)"
         case .transcriptionFailed(let detail): "Transcription failed: \(detail)"
         case .emptyTranscript: "No speech was detected."
         case .insertionFailed: "WhisperType could not insert text into the active app. The text was copied to the clipboard."

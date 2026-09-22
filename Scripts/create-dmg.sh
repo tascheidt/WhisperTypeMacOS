@@ -16,6 +16,8 @@ staging_dir=$(mktemp -d /tmp/whispertype-dmg-stage.XXXXXX)
 mount_dir="/Volumes/$volume_name"
 working_dmg=$(mktemp /tmp/whispertype-dmg.XXXXXX.dmg)
 attached=""
+verification_mount=""
+verification_attached=""
 
 if [ -e "$mount_dir" ]; then
     echo "Eject the existing '$volume_name' volume before building the DMG." >&2
@@ -24,8 +26,10 @@ fi
 
 cleanup() {
     if [ -n "$attached" ]; then hdiutil detach "$mount_dir" -quiet 2>/dev/null || true; fi
+    if [ -n "$verification_attached" ]; then hdiutil detach "$verification_mount" -quiet 2>/dev/null || true; fi
     rm -rf "$staging_dir"
     rm -f "$working_dmg"
+    if [ -n "$verification_mount" ]; then rmdir "$verification_mount" 2>/dev/null || true; fi
 }
 trap cleanup EXIT INT TERM
 
@@ -81,5 +85,14 @@ attached=""
 rm -f "$dmg_path"
 hdiutil convert "$working_dmg" -format UDZO -imagekey zlib-level=9 -o "$dmg_path" >/dev/null
 hdiutil verify "$dmg_path" >/dev/null
+
+verification_mount=$(mktemp -d /tmp/whispertype-dmg-verify.XXXXXX)
+hdiutil attach "$dmg_path" -nobrowse -readonly -mountpoint "$verification_mount" >/dev/null
+verification_attached="yes"
+"$project_root/Scripts/verify.sh" "$verification_mount/WhisperType.app"
+hdiutil detach "$verification_mount" -quiet
+verification_attached=""
+rmdir "$verification_mount"
+verification_mount=""
 
 echo "Created and verified $dmg_path"

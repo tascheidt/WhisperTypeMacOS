@@ -18,6 +18,8 @@ This replaces the old English-only base model. Q5 quantization keeps the app rea
 
 `whisper-server` keeps the model warm for low-latency repeat dictations. `whisper-cli` is retained as a reliable fallback. Neither binary depends on Homebrew.
 
+At runtime, WhisperType validates the model’s exact size and SHA-256 before starting either executable. It first uses Metal with flash attention, retries Metal without flash attention when required by older hardware or drivers, and finally uses a CPU-only compatibility mode. Packaging performs the same integrity validation and a real model-initialization smoke test before an app or DMG can be released.
+
 ## Optional writing refinement
 
 Automatic mode uses Apple's on-device Foundation Models framework when it is available, with deterministic local formatting as the universal fallback. OpenRouter is opt-in and defaults to its `~openai/gpt-latest` alias so the user can receive model upgrades without an app update; any valid OpenRouter model slug may be entered in Settings.

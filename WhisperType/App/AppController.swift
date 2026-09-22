@@ -23,6 +23,7 @@ enum AppSection: String, CaseIterable, Identifiable {
 @MainActor
 final class AppController: ObservableObject {
     @Published private(set) var status = AppStatus()
+    @Published private(set) var speechEngineHealth: SpeechEngineHealth = .checking
     @Published var selectedSection: AppSection = .home
     @Published var lastError: String?
     @Published var isCapturingShortcut = false
@@ -44,6 +45,7 @@ final class AppController: ObservableObject {
     private var pressedAt = Date()
     private var pendingRelease: Task<Void, Never>?
     private var processingTask: Task<Void, Never>?
+    private var engineCheckTask: Task<Void, Never>?
     private var captureCommandShortcut = false
     private var settingsCancellable: AnyCancellable?
     private var accessibilityCancellable: AnyCancellable?
@@ -69,13 +71,14 @@ final class AppController: ObservableObject {
             .sink { [weak self] granted in self?.setAccessibilityEnabled(granted) }
         apply(store.settings)
         refreshPermissions(prompt: false)
-        Task { await transcriber.prewarm(modelFileName: store.settings.modelFileName) }
+        checkSpeechEngine(presentFailure: store.onboardingComplete)
         if !store.onboardingComplete { showHub() }
     }
 
     func stop() {
         pendingRelease?.cancel()
         processingTask?.cancel()
+        engineCheckTask?.cancel()
         recorder.cancel()
         hotkeys.stop()
         permissions.stopMonitoring()
@@ -123,6 +126,15 @@ final class AppController: ObservableObject {
         permissions.refresh()
         guard permissions.microphoneGranted, permissions.accessibilityGranted else {
             lastError = "Grant Microphone and Accessibility access before finishing setup."
+            return
+        }
+        if case .failed(let detail) = speechEngineHealth {
+            lastError = detail
+            selectedSection = .settings
+            return
+        }
+        if speechEngineHealth == .checking {
+            lastError = "WhisperType is still checking its bundled speech model. Please wait a moment and try again."
             return
         }
         store.onboardingComplete = true
@@ -190,6 +202,41 @@ final class AppController: ObservableObject {
         } catch { return error.localizedDescription }
     }
 
+    func checkSpeechEngine(presentFailure: Bool = true) {
+        engineCheckTask?.cancel()
+        speechEngineHealth = .checking
+        let modelFileName = store.settings.modelFileName
+        engineCheckTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let mode = try await transcriber.runHealthCheck(modelFileName: modelFileName)
+                try Task.checkCancellation()
+                speechEngineHealth = .ready(mode)
+            } catch is CancellationError {
+                return
+            } catch {
+                let message = error.localizedDescription
+                speechEngineHealth = .failed(message)
+                if presentFailure {
+                    lastError = message
+                    showHub(section: .settings)
+                }
+            }
+            engineCheckTask = nil
+        }
+    }
+
+    func openSpeechEngineDiagnostics() {
+        Task {
+            let url = await transcriber.diagnosticLogURL()
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                lastError = "No speech-engine diagnostic log has been created yet."
+                return
+            }
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        }
+    }
+
     func exportData() {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "WhisperType Backup.json"
@@ -250,6 +297,11 @@ final class AppController: ObservableObject {
         permissions.refresh()
         guard permissions.microphoneGranted else {
             showError(WhisperTypeError.microphonePermission)
+            showHub(section: .settings)
+            return
+        }
+        if case .failed(let detail) = speechEngineHealth {
+            lastError = detail
             showHub(section: .settings)
             return
         }
