@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 actor TranscriptionService {
@@ -8,20 +9,62 @@ actor TranscriptionService {
         let vocabularyPrompt: String
     }
 
-    private var serverProcess: Process?
-    private var serverPort: Int?
-    private var loadedModelFileName: String?
-    private var serverReady = false
+    private enum EngineProfile: CaseIterable, Sendable {
+        case metal
+        case metalCompatibility
+        case cpuCompatibility
 
-    func prewarm(modelFileName: String) async {
-        try? await ensureServer(modelFileName: modelFileName)
+        var mode: SpeechEngineMode {
+            switch self {
+            case .metal: .metal
+            case .metalCompatibility: .metalCompatibility
+            case .cpuCompatibility: .cpuCompatibility
+            }
+        }
+
+        var arguments: [String] {
+            switch self {
+            case .metal: ["--flash-attn"]
+            case .metalCompatibility: ["--no-flash-attn"]
+            case .cpuCompatibility: ["--no-gpu", "--no-flash-attn"]
+            }
+        }
     }
 
+    private struct ValidatedModel: Sendable {
+        let url: URL
+        let byteCount: Int64
+        let modificationDate: Date?
+    }
+
+    private var serverProcess: Process?
+    private var serverLogHandle: FileHandle?
+    private var serverPort: Int?
+    private var loadedModelFileName: String?
+    private var loadedProfile: EngineProfile?
+    private var validatedModel: ValidatedModel?
+    private var serverReady = false
+
+    func prewarm(modelFileName: String) async throws -> SpeechEngineMode {
+        try await ensureServer(modelFileName: modelFileName)
+        guard let loadedProfile else {
+            throw WhisperTypeError.speechEngineUnavailable(diagnosticsMessage)
+        }
+        return loadedProfile.mode
+    }
+
+    func runHealthCheck(modelFileName: String) async throws -> SpeechEngineMode {
+        shutdown()
+        validatedModel = nil
+        return try await prewarm(modelFileName: modelFileName)
+    }
+
+    func diagnosticLogURL() -> URL { Self.diagnosticsURL }
+
     func shutdown() {
-        if let serverProcess, serverProcess.isRunning { serverProcess.terminate() }
-        serverProcess = nil
-        serverPort = nil
+        stopServer()
         loadedModelFileName = nil
+        loadedProfile = nil
         serverReady = false
     }
 
@@ -29,8 +72,19 @@ actor TranscriptionService {
         do {
             try await ensureServer(modelFileName: configuration.modelFileName)
             return try await transcribeWithServer(audioURL: audioURL, configuration: configuration)
+        } catch let error as WhisperTypeError {
+            if Task.isCancelled { throw CancellationError() }
+            switch error {
+            case .missingResource, .invalidSpeechModel:
+                throw error
+            default:
+                appendDiagnostic("Warm engine failed; switching to the CLI fallback: \(error.localizedDescription)")
+                shutdown()
+                return try await transcribeWithCLI(audioURL: audioURL, configuration: configuration)
+            }
         } catch {
             if Task.isCancelled { throw CancellationError() }
+            appendDiagnostic("Warm engine failed; switching to the CLI fallback: \(error.localizedDescription)")
             shutdown()
             return try await transcribeWithCLI(audioURL: audioURL, configuration: configuration)
         }
@@ -40,67 +94,73 @@ actor TranscriptionService {
         guard let executableURL = Bundle.main.url(forResource: "whisper-cli", withExtension: nil) else {
             throw WhisperTypeError.missingResource("whisper-cli")
         }
-        guard let modelURL = Bundle.main.url(forResource: configuration.modelFileName, withExtension: nil) else {
-            throw WhisperTypeError.missingResource(configuration.modelFileName)
-        }
-
+        let modelURL = try validatedModelURL(modelFileName: configuration.modelFileName)
         let outputBase = FileManager.default.temporaryDirectory
             .appendingPathComponent("whispertype-output-\(UUID().uuidString)")
         let outputURL = outputBase.appendingPathExtension("txt")
         defer { try? FileManager.default.removeItem(at: outputURL) }
 
-        var arguments = [
-            "--model", modelURL.path,
-            "--file", audioURL.path,
-            "--threads", String(max(4, min(10, ProcessInfo.processInfo.activeProcessorCount - 2))),
-            "--language", configuration.languageCode,
-            "--output-txt",
-            "--output-file", outputBase.path,
-            "--no-timestamps",
-            "--no-prints"
-        ]
-        if configuration.translateToEnglish { arguments.append("--translate") }
-        if !configuration.vocabularyPrompt.isEmpty {
-            arguments += ["--prompt", String(configuration.vocabularyPrompt.prefix(1_200))]
+        for profile in EngineProfile.allCases {
+            try? FileManager.default.removeItem(at: outputURL)
+            var arguments = [
+                "--model", modelURL.path,
+                "--file", audioURL.path,
+                "--threads", String(threadCount),
+                "--language", configuration.languageCode,
+                "--output-txt",
+                "--output-file", outputBase.path,
+                "--no-timestamps"
+            ] + profile.arguments
+            if configuration.translateToEnglish { arguments.append("--translate") }
+            if !configuration.vocabularyPrompt.isEmpty {
+                arguments += ["--prompt", String(configuration.vocabularyPrompt.prefix(1_200))]
+            }
+
+            let errorURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("whispertype-cli-\(UUID().uuidString).log")
+            FileManager.default.createFile(atPath: errorURL.path, contents: nil)
+            defer { try? FileManager.default.removeItem(at: errorURL) }
+            let errorHandle = try FileHandle(forWritingTo: errorURL)
+            let process = Process()
+            process.executableURL = executableURL
+            process.arguments = arguments
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = errorHandle
+
+            do {
+                try await run(process)
+            } catch {
+                try? errorHandle.close()
+                appendDiagnostic("CLI \(profile.mode.title) could not launch: \(error.localizedDescription)")
+                throw error
+            }
+            try? errorHandle.close()
+            try Task.checkCancellation()
+            let engineOutput = (try? String(contentsOf: errorURL, encoding: .utf8)) ?? ""
+            appendDiagnostic("CLI \(profile.mode.title) exited with status \(process.terminationStatus).\n\(Self.logTail(engineOutput))")
+
+            if SpeechEngineFallbackPolicy.isInitializationFailure(engineOutput),
+               profile != .cpuCompatibility { continue }
+            guard process.terminationStatus == 0 else {
+                if SpeechEngineFallbackPolicy.shouldTryNext(
+                    after: profile.mode,
+                    terminationStatus: process.terminationStatus,
+                    diagnostic: engineOutput
+                ) { continue }
+                throw WhisperTypeError.transcriptionFailed(
+                    Self.userFacingEngineDetail(engineOutput, fallback: "engine exited with status \(process.terminationStatus)")
+                )
+            }
+            guard FileManager.default.fileExists(atPath: outputURL.path) else {
+                throw WhisperTypeError.transcriptionFailed("the engine did not produce an output file")
+            }
+            let output = try String(contentsOf: outputURL, encoding: .utf8)
+            let cleaned = Self.clean(output)
+            guard !cleaned.isEmpty else { throw WhisperTypeError.emptyTranscript }
+            return cleaned
         }
 
-        let process = Process()
-        let errorPipe = Pipe()
-        process.executableURL = executableURL
-        process.arguments = arguments
-        process.standardOutput = Pipe()
-        process.standardError = errorPipe
-
-        try await run(process)
-        guard process.terminationStatus == 0 else {
-            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            let detail = String(data: errorData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            throw WhisperTypeError.transcriptionFailed(detail?.nilIfBlank ?? "engine exited with status \(process.terminationStatus)")
-        }
-        guard FileManager.default.fileExists(atPath: outputURL.path) else {
-            throw WhisperTypeError.transcriptionFailed("the engine did not produce an output file")
-        }
-        let output = try String(contentsOf: outputURL, encoding: .utf8)
-        let cleaned = Self.clean(output)
-        guard !cleaned.isEmpty else { throw WhisperTypeError.emptyTranscript }
-        return cleaned
-    }
-
-    func validateResources(modelFileName: String) -> [String] {
-        var problems: [String] = []
-        if Bundle.main.url(forResource: "whisper-cli", withExtension: nil) == nil {
-            problems.append("Missing whisper-cli")
-        }
-        if Bundle.main.url(forResource: "whisper-server", withExtension: nil) == nil {
-            problems.append("Missing whisper-server")
-        }
-        if Bundle.main.url(forResource: "engine-watchdog", withExtension: "sh") == nil {
-            problems.append("Missing engine-watchdog.sh")
-        }
-        if Bundle.main.url(forResource: modelFileName, withExtension: nil) == nil {
-            problems.append("Missing \(modelFileName)")
-        }
-        return problems
+        throw WhisperTypeError.speechEngineUnavailable(diagnosticsMessage)
     }
 
     private func ensureServer(modelFileName: String) async throws {
@@ -111,36 +171,71 @@ actor TranscriptionService {
             serverReady = true
             return
         }
-        shutdown()
+
+        let modelURL = try validatedModelURL(modelFileName: modelFileName)
         guard let executableURL = Bundle.main.url(forResource: "whisper-server", withExtension: nil) else {
             throw WhisperTypeError.missingResource("whisper-server")
         }
         guard let watchdogURL = Bundle.main.url(forResource: "engine-watchdog", withExtension: "sh") else {
             throw WhisperTypeError.missingResource("engine-watchdog.sh")
         }
-        guard let modelURL = Bundle.main.url(forResource: modelFileName, withExtension: nil) else {
-            throw WhisperTypeError.missingResource(modelFileName)
+
+        shutdown()
+        appendDiagnostic("Starting speech engine checks on \(ProcessInfo.processInfo.operatingSystemVersionString).")
+        for profile in EngineProfile.allCases {
+            do {
+                try await startServer(
+                    executableURL: executableURL,
+                    watchdogURL: watchdogURL,
+                    modelURL: modelURL,
+                    modelFileName: modelFileName,
+                    profile: profile
+                )
+                appendDiagnostic("Speech engine ready using \(profile.mode.title).")
+                return
+            } catch {
+                let wasCancelled = Task.isCancelled
+                appendDiagnostic("Speech engine \(profile.mode.title) failed: \(error.localizedDescription)")
+                stopServer()
+                if wasCancelled { throw CancellationError() }
+            }
         }
 
+        throw WhisperTypeError.speechEngineUnavailable(diagnosticsMessage)
+    }
+
+    private func startServer(
+        executableURL: URL,
+        watchdogURL: URL,
+        modelURL: URL,
+        modelFileName: String,
+        profile: EngineProfile
+    ) async throws {
         let port = Int.random(in: 52_000...61_000)
         let process = Process()
+        let logHandle = try makeServerLogHandle(profile: profile)
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
         process.arguments = [watchdogURL.path, String(ProcessInfo.processInfo.processIdentifier), executableURL.path] + [
             "--model", modelURL.path,
             "--host", "127.0.0.1",
             "--port", String(port),
-            "--threads", String(max(4, min(10, ProcessInfo.processInfo.activeProcessorCount - 2))),
+            "--threads", String(threadCount),
             "--language", "auto",
-            "--flash-attn",
             "--no-timestamps"
-        ]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do { try process.run() }
-        catch { throw WhisperTypeError.transcriptionFailed("could not start the local engine: \(error.localizedDescription)") }
+        ] + profile.arguments
+        process.standardOutput = logHandle
+        process.standardError = logHandle
+        do {
+            try process.run()
+        } catch {
+            try? logHandle.close()
+            throw WhisperTypeError.transcriptionFailed("could not start the local engine: \(error.localizedDescription)")
+        }
         serverProcess = process
+        serverLogHandle = logHandle
         serverPort = port
         loadedModelFileName = modelFileName
+        loadedProfile = profile
         serverReady = false
         try await waitUntilReady(process: process, port: port)
         serverReady = true
@@ -150,7 +245,11 @@ actor TranscriptionService {
         let healthURL = URL(string: "http://127.0.0.1:\(port)/")!
         for _ in 0..<600 {
             try Task.checkCancellation()
-            if !process.isRunning { throw WhisperTypeError.transcriptionFailed("the local engine stopped while loading the model") }
+            if !process.isRunning {
+                throw WhisperTypeError.transcriptionFailed(
+                    "the local engine stopped while loading the model (exit \(process.terminationStatus))"
+                )
+            }
             var request = URLRequest(url: healthURL)
             request.timeoutInterval = 0.25
             if let (_, response) = try? await URLSession.shared.data(for: request),
@@ -203,6 +302,45 @@ actor TranscriptionService {
         return cleaned
     }
 
+    private func validatedModelURL(modelFileName: String) throws -> URL {
+        guard let modelURL = Bundle.main.url(forResource: modelFileName, withExtension: nil) else {
+            throw WhisperTypeError.missingResource(modelFileName)
+        }
+        let attributes = try FileManager.default.attributesOfItem(atPath: modelURL.path)
+        let byteCount = (attributes[.size] as? NSNumber)?.int64Value ?? -1
+        let modificationDate = attributes[.modificationDate] as? Date
+        if let validatedModel,
+           validatedModel.url == modelURL,
+           validatedModel.byteCount == byteCount,
+           validatedModel.modificationDate == modificationDate {
+            return modelURL
+        }
+
+        let digest = try Self.sha256(for: modelURL)
+        if let problem = SpeechModelManifest.integrityProblem(
+            fileName: modelFileName,
+            byteCount: byteCount,
+            sha256: digest
+        ) {
+            appendDiagnostic("Speech model integrity check failed: \(problem)")
+            throw WhisperTypeError.invalidSpeechModel(problem)
+        }
+        validatedModel = ValidatedModel(url: modelURL, byteCount: byteCount, modificationDate: modificationDate)
+        appendDiagnostic("Speech model integrity check passed (\(byteCount) bytes, SHA-256 \(digest)).")
+        return modelURL
+    }
+
+    private func stopServer() {
+        if let serverProcess, serverProcess.isRunning { serverProcess.terminate() }
+        try? serverLogHandle?.close()
+        serverProcess = nil
+        serverLogHandle = nil
+        serverPort = nil
+        loadedModelFileName = nil
+        loadedProfile = nil
+        serverReady = false
+    }
+
     private func run(_ process: Process) async throws {
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -219,6 +357,70 @@ actor TranscriptionService {
         }
     }
 
+    private func makeServerLogHandle(profile: EngineProfile) throws -> FileHandle {
+        try Self.prepareDiagnosticsFile()
+        let handle = try FileHandle(forWritingTo: Self.diagnosticsURL)
+        try handle.seekToEnd()
+        handle.write(Data("\n[\(Self.timestamp)] Starting \(profile.mode.title) server\n".utf8))
+        return handle
+    }
+
+    private func appendDiagnostic(_ message: String) {
+        guard (try? Self.prepareDiagnosticsFile()) != nil,
+              let handle = try? FileHandle(forWritingTo: Self.diagnosticsURL) else { return }
+        defer { try? handle.close() }
+        _ = try? handle.seekToEnd()
+        handle.write(Data("[\(Self.timestamp)] \(message)\n".utf8))
+    }
+
+    private var diagnosticsMessage: String {
+        "Diagnostics were saved to \(Self.diagnosticsURL.path)."
+    }
+
+    private var threadCount: Int {
+        max(4, min(10, ProcessInfo.processInfo.activeProcessorCount - 2))
+    }
+
+    private static var diagnosticsURL: URL {
+        FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Logs/WhisperType/engine.log")
+    }
+
+    private static var timestamp: String { ISO8601DateFormatter().string(from: Date()) }
+
+    private static func prepareDiagnosticsFile() throws {
+        let directory = diagnosticsURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: diagnosticsURL.path) {
+            FileManager.default.createFile(atPath: diagnosticsURL.path, contents: nil)
+        }
+        let attributes = try FileManager.default.attributesOfItem(atPath: diagnosticsURL.path)
+        let size = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+        if size > 2_000_000 {
+            let data = try Data(contentsOf: diagnosticsURL)
+            try Data(data.suffix(250_000)).write(to: diagnosticsURL, options: .atomic)
+        }
+    }
+
+    private static func sha256(for url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while let data = try handle.read(upToCount: 4 * 1_024 * 1_024), !data.isEmpty {
+            hasher.update(data: data)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func userFacingEngineDetail(_ output: String, fallback: String) -> String {
+        let lines = output.split(whereSeparator: \.isNewline).map(String.init)
+        return lines.last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) ?? fallback
+    }
+
+    private static func logTail(_ output: String) -> String {
+        String(output.suffix(8_000))
+    }
+
     private static func clean(_ text: String) -> String {
         var value = text
             .replacingOccurrences(of: "[BLANK_AUDIO]", with: "", options: .caseInsensitive)
@@ -231,11 +433,4 @@ actor TranscriptionService {
 
 private extension Data {
     mutating func appendUTF8(_ value: String) { append(Data(value.utf8)) }
-}
-
-private extension String {
-    var nilIfBlank: String? {
-        let clean = trimmingCharacters(in: .whitespacesAndNewlines)
-        return clean.isEmpty ? nil : clean
-    }
 }

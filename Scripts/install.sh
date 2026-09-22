@@ -9,6 +9,7 @@ if [ "${WHISPERTYPE_SKIP_BUILD:-0}" != "1" ]; then
     "$project_root/Scripts/build-release.sh"
 fi
 test -d "$source_app"
+"$project_root/Scripts/verify.sh" "$source_app"
 
 osascript -e 'tell application id "com.tsadvisory.whispertype.WhisperType" to quit' 2>/dev/null || true
 for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -26,7 +27,7 @@ if [ -d "$destination_app" ]; then
     mv "$destination_app" "$previous_app"
 fi
 
-if ! ditto "$source_app" "$destination_app" || ! codesign --verify --deep --strict "$destination_app"; then
+if ! ditto "$source_app" "$destination_app" || ! "$project_root/Scripts/verify.sh" "$destination_app"; then
     rm -rf "$destination_app"
     if [ -n "$previous_app" ] && [ -d "$previous_app" ]; then mv "$previous_app" "$destination_app"; fi
     exit 1

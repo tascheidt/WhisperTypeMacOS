@@ -3,6 +3,64 @@ import XCTest
 @testable import WhisperTypeCore
 
 final class TextProcessingTests: XCTestCase {
+    func testSpeechModelManifestAcceptsOnlyTheReleaseModel() {
+        XCTAssertNil(SpeechModelManifest.integrityProblem(
+            fileName: SpeechModelManifest.fileName,
+            byteCount: SpeechModelManifest.expectedByteCount,
+            sha256: SpeechModelManifest.expectedSHA256
+        ))
+        XCTAssertTrue(SpeechModelManifest.integrityProblem(
+            fileName: SpeechModelManifest.fileName,
+            byteCount: 134,
+            sha256: SpeechModelManifest.expectedSHA256
+        )?.contains("Git LFS") == true)
+        XCTAssertTrue(SpeechModelManifest.integrityProblem(
+            fileName: SpeechModelManifest.fileName,
+            byteCount: 2_000_000,
+            sha256: SpeechModelManifest.expectedSHA256
+        )?.contains("unexpected size") == true)
+        XCTAssertNotNil(SpeechModelManifest.integrityProblem(
+            fileName: SpeechModelManifest.fileName,
+            byteCount: SpeechModelManifest.expectedByteCount,
+            sha256: String(repeating: "0", count: 64)
+        ))
+        XCTAssertNotNil(SpeechModelManifest.integrityProblem(
+            fileName: "different-model.bin",
+            byteCount: SpeechModelManifest.expectedByteCount,
+            sha256: SpeechModelManifest.expectedSHA256
+        ))
+    }
+
+    func testSpeechEngineHealthLabelsCompatibilityModes() {
+        XCTAssertEqual(SpeechEngineHealth.checking.title, "Checking…")
+        XCTAssertEqual(SpeechEngineHealth.ready(.metal).title, "Ready • Metal")
+        XCTAssertTrue(SpeechEngineMode.cpuCompatibility.isDegraded)
+        XCTAssertFalse(SpeechEngineMode.metal.isDegraded)
+    }
+
+    func testSpeechEngineFallbackRetriesCrashesAndInitializationFailures() {
+        XCTAssertTrue(SpeechEngineFallbackPolicy.shouldTryNext(
+            after: .metal,
+            terminationStatus: 6,
+            diagnostic: ""
+        ))
+        XCTAssertTrue(SpeechEngineFallbackPolicy.shouldTryNext(
+            after: .metalCompatibility,
+            terminationStatus: 3,
+            diagnostic: "error: failed to initialize whisper context"
+        ))
+        XCTAssertFalse(SpeechEngineFallbackPolicy.shouldTryNext(
+            after: .cpuCompatibility,
+            terminationStatus: 3,
+            diagnostic: "error: failed to initialize whisper context"
+        ))
+        XCTAssertFalse(SpeechEngineFallbackPolicy.shouldTryNext(
+            after: .metal,
+            terminationStatus: 0,
+            diagnostic: ""
+        ))
+    }
+
     func testPermissionStatesChooseTheCorrectRecoveryAction() {
         XCTAssertEqual(PermissionGrantState.notRequested.action, .request)
         XCTAssertEqual(PermissionGrantState.denied.action, .openSettings)

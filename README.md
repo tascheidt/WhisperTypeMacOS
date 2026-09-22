@@ -1,4 +1,4 @@
-# WhisperType 2.0.1
+# WhisperType 2.0.2
 
 WhisperType is a local-first macOS dictation app that turns natural speech into polished text in any application. Hold **Fn**, speak, and release to insert. Double-tap Fn for hands-free mode.
 
@@ -10,6 +10,7 @@ The app ships with its speech engine and model. Ollama, Homebrew, Python, and an
 - Double-tap hands-free dictation and Escape-to-cancel
 - Fast, private, multilingual transcription with Whisper large-v3-turbo Q5 on Metal
 - A warm local engine for low-latency repeat dictations, plus a self-contained CLI fallback
+- Startup model-integrity checks and automatic Metal, Metal-compatibility, and CPU recovery modes
 - Smart formatting: punctuation commands, paragraphs, bullets, filler removal, and “scratch that” backtracking
 - Context-aware capitalization and spacing using the active text field
 - Personal dictionary with recognition hints and correction rules
@@ -46,7 +47,7 @@ To create a drag-to-Applications disk image:
 ./Scripts/create-dmg.sh
 ```
 
-The result is `Dist/WhisperType-<version>.dmg`. Open it and drag WhisperType onto the Applications folder. If the app is accidentally opened from the disk image, it offers to move itself to Applications before requesting permissions; onboarding never binds permissions to the mounted copy.
+The result is `Dist/WhisperType-<version>.dmg`. Open it and drag WhisperType onto the Applications folder. If the app is accidentally opened from the disk image, it offers to move itself to Applications before requesting permissions; onboarding never binds permissions to the mounted copy. Release creation automatically retrieves the model with Git LFS or from its pinned upstream source when needed, verifies its exact size and SHA-256, and proves the bundled engine can load it. The finished compressed DMG is mounted and independently checked again.
 
 The build script automatically uses a Developer ID or Apple Development identity when one is installed. Otherwise it applies a stable local designated requirement so Microphone and Accessibility grants survive rebuilds on the development Mac. Distributing to other Macs without a Gatekeeper warning still requires a Developer ID certificate and notarization.
 
@@ -76,6 +77,12 @@ Run all core tests and compile the app:
 ./Scripts/test.sh
 ```
 
+Tests verify the local model without downloading it. If the checkout contains a Git LFS pointer, retrieve and verify the model first:
+
+```sh
+./Scripts/fetch-model.sh
+```
+
 Verify a packaged app:
 
 ```sh
@@ -89,6 +96,7 @@ Architecture and model provenance are documented in [Docs/ARCHITECTURE.md](Docs/
 - **Fn does nothing:** Open Settings → Privacy & Security → Accessibility and enable WhisperType. The onboarding screen refreshes automatically when you return. If an older build is already enabled but the app still says access is required, turn the entry off and on once.
 - **No recording:** On first use, click Allow and accept the native macOS prompt. If access was denied earlier, the button changes to Open Settings and takes you directly to Privacy & Security → Microphone.
 - **The first dictation is slow:** The large speech model warms in the background at launch. Later dictations reuse it and are substantially faster.
+- **Speech engine needs attention:** Open Settings and click **Run check**. WhisperType retries Metal without flash attention and then CPU compatibility mode automatically. Click **Show diagnostics…** to reveal the local engine log if every mode fails.
 - **Text is copied but not inserted:** The target app blocked simulated paste. Paste manually with Command-V and verify Accessibility permission.
 - **OpenRouter fails:** Confirm the key and model slug in Settings, or switch the provider back to Automatic.
 

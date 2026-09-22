@@ -2,6 +2,7 @@
 set -eu
 
 project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+. "$project_root/Scripts/model-metadata.sh"
 app_path="${1:-$project_root/Dist/WhisperType.app}"
 resources="$app_path/Contents/Resources"
 
@@ -9,7 +10,7 @@ test -x "$app_path/Contents/MacOS/WhisperType"
 test -x "$resources/whisper-cli"
 test -x "$resources/whisper-server"
 test -x "$resources/engine-watchdog.sh"
-test -f "$resources/ggml-large-v3-turbo-q5_0.bin"
+test -f "$resources/$model_file_name"
 
 plutil -lint "$app_path/Contents/Info.plist"
 codesign --verify --deep --strict --verbose=2 "$app_path"
@@ -39,10 +40,38 @@ if otool -L "$resources/whisper-cli" "$resources/whisper-server" | grep -E '/opt
     exit 1
 fi
 
-model_hash=$(shasum -a 256 "$resources/ggml-large-v3-turbo-q5_0.bin" | awk '{print $1}')
-expected_hash="394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2"
-if [ "$model_hash" != "$expected_hash" ]; then
+model_size=$(stat -f %z "$resources/$model_file_name")
+if [ "$model_size" != "$model_expected_size" ]; then
+    echo "Speech model size mismatch ($model_size bytes; expected $model_expected_size)." >&2
+    exit 1
+fi
+
+model_hash=$(shasum -a 256 "$resources/$model_file_name" | awk '{print $1}')
+if [ "$model_hash" != "$model_expected_sha256" ]; then
     echo "Speech model checksum mismatch." >&2
+    exit 1
+fi
+
+smoke_log=$(mktemp /tmp/whispertype-model-smoke.XXXXXX)
+cleanup() { rm -f "$smoke_log"; }
+trap cleanup EXIT INT TERM
+set +e
+"$resources/whisper-cli" \
+    --model "$resources/$model_file_name" \
+    --file /dev/null \
+    --no-gpu \
+    --no-flash-attn \
+    --no-prints >"$smoke_log" 2>&1
+smoke_exit=$?
+set -e
+if grep -Eqi 'failed to initialize whisper context|failed to load model' "$smoke_log"; then
+    echo "The bundled speech engine could not initialize the bundled model." >&2
+    sed -n '1,120p' "$smoke_log" >&2
+    exit 1
+fi
+if ! grep -q "failed to read audio file '/dev/null'" "$smoke_log"; then
+    echo "The speech model load smoke test returned an unexpected result (exit $smoke_exit)." >&2
+    sed -n '1,120p' "$smoke_log" >&2
     exit 1
 fi
 
